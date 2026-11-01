@@ -7,8 +7,14 @@
     "license": "MIT",
     "require": {
         "php": "^8.2",
+        "barryvdh/laravel-dompdf": "*",
+        "knuckleswtf/scribe": "*",
         "laravel/framework": "^12.0",
-        "laravel/tinker": "^2.10.1"
+        "laravel/reverb": "*",
+        "laravel/sanctum": "*",
+        "laravel/tinker": "^2.10.1",
+        "maatwebsite/excel": "*",
+        "spatie/laravel-permission": "*"
     },
     "require-dev": {
         "fakerphp/faker": "^1.23",
@@ -24,7 +30,23 @@
             "App\\": "app/",
             "Database\\Factories\\": "database/factories/",
             "Database\\Seeders\\": "database/seeders/"
-        }
+        },
+        "classmap": [
+            "app/Models/Table.php",
+            "app/Models/ProductSize.php",
+            "app/Models/OrderItem.php",
+            "app/Models/InventoryItem.php",
+            "app/Models/Recipe.php",
+            "app/Models/Customer.php",
+            "app/Models/Expense.php",
+            "app/Http/Controllers/API/TableController.php",
+            "app/Http/Controllers/API/InventoryItemController.php",
+            "app/Http/Controllers/API/EmployeeController.php",
+            "app/Http/Controllers/API/ExpenseController.php",
+            "app/Http/Controllers/API/SettingController.php",
+            "app/Http/Controllers/API/UserController.php",
+            "app/Http/Controllers/API/ProductSizeController.php"
+        ]
     },
     "autoload-dev": {
         "psr-4": {
