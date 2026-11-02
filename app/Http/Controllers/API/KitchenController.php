@@ -134,20 +134,39 @@ class KitchenController extends Controller
             abort(403);
         }
         $validated = $request->validate([
-            'kitchen_status' => 'required|in:pending,confirmed,preparing,ready,served,cancelled',
-            'station_id' => 'nullable|exists:kitchen_stations,id',
+            'kitchen_status' => 'required_without:status|in:pending,confirmed,preparing,ready,served,cancelled',
+            'status' => 'required_without:kitchen_status|in:pending,confirmed,preparing,ready,served,cancelled',
+            'station_id' => 'nullable|integer',
         ]);
 
-        $orderItem->update(['kitchen_status' => $validated['kitchen_status']]);
+        $status = $validated['kitchen_status'] ?? $validated['status'];
+        $stationId = $validated['station_id'] ?? null;
 
-        // If completed at a station, mark completed_at
-        if ($validated['kitchen_status'] === 'ready' && $validated['station_id']) {
-            OrderKitchenStation::where('order_item_id', $orderItem->id)
-                ->where('station_id', $validated['station_id'])
-                ->update(['completed_at' => now()]);
+        if ($stationId !== null) {
+            $stationBelongsToRestaurant = KitchenStation::where('restaurant_id', $request->user()->restaurant_id)
+                ->whereKey($stationId)
+                ->exists();
+            if (!$stationBelongsToRestaurant) {
+                abort(422, 'محطة المطبخ المحددة غير موجودة');
+            }
         }
 
-        return response()->json(['order_item' => $orderItem->fresh(), 'message' => 'تم تحديث حالة التحضير']);
+        return DB::transaction(function () use ($orderItem, $status, $stationId) {
+            $orderItem->update(['kitchen_status' => $status]);
+
+            if ($status === 'ready') {
+                $stationQuery = OrderKitchenStation::where('order_item_id', $orderItem->id);
+                if ($stationId !== null) {
+                    $stationQuery->where('station_id', $stationId);
+                }
+                $stationQuery->update(['completed_at' => now()]);
+            }
+
+            return response()->json([
+                'order_item' => $orderItem->fresh(),
+                'message' => 'تم تحديث حالة التحضير',
+            ]);
+        });
     }
 
     public function startTimer(Request $request, OrderItem $orderItem)

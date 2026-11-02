@@ -85,14 +85,7 @@ class OrderController extends Controller
         $restaurantId = $user->restaurant_id;
 
         return DB::transaction(function () use ($validated, $user, $restaurantId) {
-            // Generate order number
-            $date = Carbon::now()->format('Ymd');
-            $last = Order::where('restaurant_id', $restaurantId)
-                ->where('order_number', 'like', "ORD-{$date}-%")
-                ->orderByDesc('order_number')
-                ->first();
-            $seq = $last ? ((int) explode('-', $last->order_number)[2] + 1) : 1;
-            $orderNumber = "ORD-{$date}-" . str_pad($seq, 4, '0', STR_PAD_LEFT);
+            $orderNumber = $this->nextOrderNumber();
 
             $subtotal = 0;
             $taxAmount = 0;
@@ -267,7 +260,7 @@ class OrderController extends Controller
                 'order' => $order->load(['items.product', 'items.modifiers.modifierOption', 'table', 'customer', 'cashier']),
                 'message' => 'تم إنشاء الطلب بنجاح',
             ], 201);
-        });
+        }, 5);
     }
 
     public function show(Order $order)
@@ -676,6 +669,44 @@ class OrderController extends Controller
         }
 
         return $price;
+    }
+
+    private function nextOrderNumber(): string
+    {
+        $now = Carbon::now();
+        $date = $now->format('Ymd');
+        $sequenceDate = $now->toDateString();
+
+        DB::table('order_number_sequences')->insertOrIgnore([
+            'sequence_date' => $sequenceDate,
+            'last_sequence' => 0,
+            'created_at' => $now,
+            'updated_at' => $now,
+        ]);
+
+        $sequence = DB::table('order_number_sequences')
+            ->where('sequence_date', $sequenceDate)
+            ->lockForUpdate()
+            ->first();
+
+        $latestExistingNumber = DB::table('orders')
+            ->where('order_number', 'like', "ORD-{$date}-%")
+            ->orderByRaw('LENGTH(order_number) DESC')
+            ->orderByDesc('order_number')
+            ->value('order_number');
+        $existingSequence = $latestExistingNumber
+            ? (int) substr($latestExistingNumber, strrpos($latestExistingNumber, '-') + 1)
+            : 0;
+        $nextSequence = max((int) $sequence->last_sequence, $existingSequence) + 1;
+
+        DB::table('order_number_sequences')
+            ->where('id', $sequence->id)
+            ->update([
+                'last_sequence' => $nextSequence,
+                'updated_at' => $now,
+            ]);
+
+        return "ORD-{$date}-" . str_pad((string) $nextSequence, 4, '0', STR_PAD_LEFT);
     }
 
     protected function restoreInventoryForProduct($productId, $qty, $userId, $orderId)

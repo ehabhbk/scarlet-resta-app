@@ -4,6 +4,8 @@ namespace Tests\Feature;
 
 use App\Models\Order;
 use App\Models\OrderItem;
+use App\Models\OrderKitchenStation;
+use App\Models\KitchenStation;
 use App\Models\Product;
 use App\Models\Restaurant;
 use App\Models\Shift;
@@ -151,6 +153,63 @@ class OrderWorkflowTest extends TestCase
             ->assertOk();
 
         $this->assertSoftDeleted('orders', ['id' => $order->id]);
+    }
+
+    public function test_new_order_numbers_skip_soft_deleted_orders(): void
+    {
+        $shift = $this->createShift();
+        $product = $this->createProduct('Tea', 10);
+        $deletedOrder = $this->createOrder($shift, $product, 10);
+        $date = now()->format('Ymd');
+        $deletedOrder->update(['order_number' => "ORD-{$date}-0007"]);
+        $deletedOrder->delete();
+
+        $this->postJson('/api/orders', [
+            'type' => 'takeaway',
+            'payment_method' => 'cash',
+            'items' => [
+                ['product_id' => $product->id, 'quantity' => 1],
+            ],
+        ])->assertCreated()
+            ->assertJsonPath('order.order_number', "ORD-{$date}-0008");
+
+        $this->postJson('/api/orders', [
+            'type' => 'takeaway',
+            'payment_method' => 'cash',
+            'items' => [
+                ['product_id' => $product->id, 'quantity' => 1],
+            ],
+        ])->assertCreated()
+            ->assertJsonPath('order.order_number', "ORD-{$date}-0009");
+
+        $this->assertDatabaseHas('order_number_sequences', [
+            'sequence_date' => now()->toDateString(),
+            'last_sequence' => 9,
+        ]);
+    }
+
+    public function test_kitchen_item_can_be_marked_ready_using_status_payload(): void
+    {
+        $shift = $this->createShift();
+        $product = $this->createProduct('Tea', 10);
+        $order = $this->createOrder($shift, $product, 10);
+        $item = $order->items()->firstOrFail();
+        $station = KitchenStation::create([
+            'restaurant_id' => $this->restaurant->id,
+            'name' => 'Drinks',
+        ]);
+        $assignment = OrderKitchenStation::create([
+            'order_item_id' => $item->id,
+            'station_id' => $station->id,
+        ]);
+
+        $this->postJson('/api/kitchen/order-items/' . $item->id . '/status', [
+            'status' => 'ready',
+            'station_id' => $station->id,
+        ])->assertOk()
+            ->assertJsonPath('order_item.kitchen_status', 'ready');
+
+        $this->assertNotNull($assignment->fresh()->completed_at);
     }
 
     private function createShift(): Shift
