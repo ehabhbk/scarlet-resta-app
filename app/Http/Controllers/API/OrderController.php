@@ -314,6 +314,44 @@ class OrderController extends Controller
         return response()->json(['message' => 'تم حذف الطلب']);
     }
 
+    public function refund(Request $request, Order $order)
+    {
+        if ($order->restaurant_id !== auth()->user()->restaurant_id) {
+            abort(403);
+        }
+        if ($order->payment_status !== 'paid') {
+            return response()->json(['message' => 'لا يمكن استرجاع دفع غير مدفوع'], 400);
+        }
+        $user = $request->user();
+        $validated = $request->validate(['reason' => 'nullable|string']);
+        return DB::transaction(function () use ($order, $user, $validated) {
+            foreach ($order->items as $item) {
+                $this->restoreInventoryForProduct($item->product_id, $item->quantity, $user->id, $order->id);
+                Product::where('id', $item->product_id)
+                    ->where('sales_count', '>=', $item->quantity)
+                    ->decrement('sales_count', $item->quantity);
+            }
+            if ($order->table_id) {
+                Table::where('id', $order->table_id)->update(['status' => 'available']);
+            }
+            $order->update([
+                'status' => 'cancelled',
+                'payment_status' => 'refunded',
+                'cancelled_at' => now(),
+                'cancelled_by' => $user->id,
+                'cancellation_reason' => $validated['reason'] ?? 'استرجاع',
+            ]);
+            OrderStatusHistory::create([
+                'order_id' => $order->id,
+                'old_status' => $order->getOriginal('status'),
+                'new_status' => 'cancelled',
+                'changed_by' => $user->id,
+                'notes' => 'استرجاع دفع: ' . ($validated['reason'] ?? 'بدون سبب'),
+            ]);
+            return response()->json(['order' => $order->fresh(), 'message' => 'تم استرجاع الدفع وإلغاء الطلب']);
+        });
+    }
+
     public function cancel(Request $request, Order $order)
     {
         if ($order->restaurant_id !== auth()->user()->restaurant_id) {

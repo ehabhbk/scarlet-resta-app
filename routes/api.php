@@ -63,6 +63,7 @@ Route::middleware(['auth:sanctum', 'audit'])->apiResource('tables', \App\Http\Co
 // Orders
 Route::middleware(['auth:sanctum', 'audit'])->apiResource('orders', \App\Http\Controllers\API\OrderController::class);
 Route::middleware(['auth:sanctum', 'audit'])->post('orders/{order}/cancel', [\App\Http\Controllers\API\OrderController::class, 'cancel']);
+Route::middleware(['auth:sanctum', 'audit'])->post('orders/{order}/refund', [\App\Http\Controllers\API\OrderController::class, 'refund']);
 Route::middleware(['auth:sanctum', 'audit'])->post('orders/{order}/status', [\App\Http\Controllers\API\OrderController::class, 'updateStatus']);
 Route::middleware(['auth:sanctum', 'audit'])->post('orders/{order}/payment', [\App\Http\Controllers\API\OrderController::class, 'recordPayment']);
 
