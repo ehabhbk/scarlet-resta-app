@@ -116,7 +116,7 @@ class ReportController extends Controller
     public function staff(Request $request)
     {
         $restaurantId = $request->user()->restaurant_id;
-        $staff = User::where('restaurant_id', $restaurantId)->where('is_active', true)->get()->map(function ($u) {
+        $staff = User::where('restaurant_id', $restaurantId)->where('is_active', true)->get()->map(function ($u) use ($restaurantId) {
             return [
                 'name' => $u->name,
                 'role' => $u->getRoleNames()->first(),

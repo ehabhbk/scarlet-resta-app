@@ -59,10 +59,49 @@ class KitchenController extends Controller
     {
         $restaurantId = $request->user()->restaurant_id;
         $stations = KitchenStation::where('restaurant_id', $restaurantId)
-            ->where('is_active', true)
             ->orderBy('sort_order')
             ->get();
         return response()->json(['stations' => $stations]);
+    }
+
+    public function storeStation(Request $request)
+    {
+        $validated = $request->validate([
+            'name' => 'required|string|max:100',
+            'color' => 'nullable|string|max:20',
+            'sort_order' => 'nullable|integer|min:0',
+            'is_active' => 'boolean',
+        ]);
+        $validated['restaurant_id'] = $request->user()->restaurant_id;
+        $validated['color'] = $validated['color'] ?? '#3b82f6';
+        $validated['sort_order'] = $validated['sort_order'] ?? 0;
+        $validated['is_active'] = $request->boolean('is_active', true);
+        $station = KitchenStation::create($validated);
+        return response()->json(['station' => $station, 'message' => 'تم إضافة المحطة'], 201);
+    }
+
+    public function updateStation(Request $request, KitchenStation $station)
+    {
+        if ($station->restaurant_id !== auth()->user()->restaurant_id) {
+            abort(403);
+        }
+        $validated = $request->validate([
+            'name' => 'sometimes|string|max:100',
+            'color' => 'sometimes|string|max:20',
+            'sort_order' => 'sometimes|integer|min:0',
+            'is_active' => 'sometimes|boolean',
+        ]);
+        $station->update($validated);
+        return response()->json(['station' => $station->fresh(), 'message' => 'تم تحديث المحطة']);
+    }
+
+    public function destroyStation(KitchenStation $station)
+    {
+        if ($station->restaurant_id !== auth()->user()->restaurant_id) {
+            abort(403);
+        }
+        $station->delete();
+        return response()->json(['message' => 'تم حذف المحطة']);
     }
 
     public function assignStation(Request $request, OrderItem $orderItem)

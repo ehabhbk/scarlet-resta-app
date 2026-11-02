@@ -7,8 +7,9 @@ use App\Models\Product;
 use App\Models\Category;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Validator;
-use App\Services\ProductService;
+use App\Http\Services\ProductService;
+use App\Http\Requests\Product\StoreProductRequest;
+use App\Http\Resources\ProductResource;
 
 class ProductController extends Controller
 {
@@ -38,33 +39,14 @@ class ProductController extends Controller
             });
         }
 
-        $products = $query->with('category')->orderBy('sort_order')->paginate(15);
+        $products = $query->with('category', 'sizes', 'modifiers.options')->orderBy('sort_order')->paginate(15);
 
-        return response()->json($products);
+        return ProductResource::collection($products);
     }
 
-    public function store(Request $request)
+    public function store(StoreProductRequest $request)
     {
-        $validated = $request->validate([
-            'category_id' => 'nullable|exists:categories,id',
-            'name' => 'required|string|max:255',
-            'slug' => 'nullable|string|max:255|unique:products,slug',
-            'sku' => 'nullable|string|max:100|unique:products,sku',
-            'barcode' => 'nullable|string|max:100|unique:products,barcode',
-            'description' => 'nullable|string',
-            'image' => 'nullable|string',
-            'sale_price' => 'required|numeric|min:0',
-            'cost_price' => 'required|numeric|min:0',
-            'tax_rate' => 'nullable|numeric|min:0|max:1',
-            'track_inventory' => 'boolean',
-            'current_stock' => 'nullable|integer|min:0',
-            'min_stock' => 'nullable|integer|min:0',
-            'is_available' => 'boolean',
-            'is_featured' => 'boolean',
-            'is_best_seller' => 'boolean',
-            'sort_order' => 'nullable|integer|min:0',
-        ]);
-
+        $validated = $request->validated();
         $validated['restaurant_id'] = $request->user()->restaurant_id;
         $validated['slug'] = $validated['slug'] ?? \Illuminate\Support\Str::slug($validated['name']);
         $validated['track_inventory'] = $request->boolean('track_inventory', true);
@@ -72,13 +54,16 @@ class ProductController extends Controller
 
         $product = $this->service->create($validated);
 
-        return response()->json(['product' => $product, 'message' => 'تم إضافة المنتج بنجاح'], 201);
+        return (new ProductResource($product))
+            ->additional(['message' => 'تم إضافة المنتج بنجاح'])
+            ->response()
+            ->setStatusCode(201);
     }
 
     public function show(Product $product)
     {
         $this->authorizeRestaurant($product);
-        return response()->json(['product' => $product->load('category', 'sizes', 'modifiers.options')]);
+        return new ProductResource($product->load('category', 'sizes', 'modifiers.options'));
     }
 
     public function update(Request $request, Product $product)
@@ -130,6 +115,23 @@ class ProductController extends Controller
     {
         $this->authorizeRestaurant($product);
         return response()->json(['modifiers' => $product->modifiers()->with('options')->get()]);
+    }
+
+    public function uploadImage(Request $request, Product $product)
+    {
+        $this->authorizeRestaurant($product);
+        $request->validate([
+            'image' => 'required|image|mimes:jpeg,png,jpg,gif,webp|max:2048',
+        ]);
+        if ($request->hasFile('image')) {
+            $file = $request->file('image');
+            $filename = 'products/' . $product->id . '_' . time() . '.' . $file->getClientOriginalExtension();
+            $path = $file->storeAs('public', $filename);
+            $url = '/storage/' . $filename;
+            $product->update(['image' => $url]);
+            return response()->json(['image' => $url, 'message' => 'تم رفع الصورة']);
+        }
+        return response()->json(['message' => 'لم يتم رفع ملف'], 400);
     }
 
     protected function authorizeRestaurant($model)

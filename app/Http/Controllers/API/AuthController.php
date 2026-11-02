@@ -3,22 +3,16 @@
 namespace App\Http\Controllers\API;
 
 use App\Http\Controllers\Controller;
+use App\Http\Requests\Auth\LoginRequest;
+use App\Http\Resources\UserResource;
 use App\Models\User;
-use App\Models\Restaurant;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
-use Illuminate\Support\Facades\Validator;
-use Laravel\Sanctum\PersonalAccessToken;
 
 class AuthController extends Controller
 {
-    public function login(Request $request)
+    public function login(LoginRequest $request)
     {
-        $request->validate([
-            'email' => 'required|email',
-            'password' => 'required|string',
-        ]);
-
         $user = User::where('email', $request->email)->first();
 
         if (!$user || !Hash::check($request->password, $user->password)) {
@@ -32,7 +26,7 @@ class AuthController extends Controller
         $token = $user->createToken('auth_token')->plainTextToken;
 
         return response()->json([
-            'user' => $user->load('restaurant', 'roles'),
+            'user' => new UserResource($user->load('restaurant', 'roles')),
             'token' => $token,
             'message' => 'تم تسجيل الدخول بنجاح',
         ]);
@@ -51,20 +45,19 @@ class AuthController extends Controller
         $user = User::create([
             'name' => $request->name,
             'email' => $request->email,
-            'password' => Hash::make($request->password),
+            'password' => $request->password,
             'restaurant_id' => $request->restaurant_id,
             'phone' => $request->phone,
             'is_active' => true,
         ]);
 
-        // Assign default role Cashier if not super admin creating
         $role = $request->role ?? 'Cashier';
         $user->assignRole($role, 'sanctum');
 
         $token = $user->createToken('auth_token')->plainTextToken;
 
         return response()->json([
-            'user' => $user->load('restaurant', 'roles'),
+            'user' => new UserResource($user->load('restaurant', 'roles')),
             'token' => $token,
             'message' => 'تم إنشاء الحساب بنجاح',
         ], 201);
@@ -79,7 +72,7 @@ class AuthController extends Controller
     public function me(Request $request)
     {
         return response()->json([
-            'user' => $request->user()->load('restaurant', 'roles'),
+            'user' => new UserResource($request->user()->load('restaurant', 'roles')),
         ]);
     }
 
@@ -87,7 +80,7 @@ class AuthController extends Controller
     {
         $restaurant = $request->user()->restaurant;
         if (!$restaurant) {
-            return response()->json(['message' => 'لا يوجد مطربط بالمستخدم'], 404);
+            return response()->json(['message' => 'لا يوجد مطرب مرتبط بالمستخدم'], 404);
         }
         return response()->json(['restaurant' => $restaurant]);
     }

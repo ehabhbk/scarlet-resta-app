@@ -6,7 +6,10 @@ use App\Http\Controllers\Controller;
 use App\Models\Employee;
 use App\Models\User;
 use App\Models\Attendance;
+use App\Models\Order;
+use App\Models\Shift;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
 
 class EmployeeController extends Controller
@@ -164,11 +167,94 @@ class ShiftController extends Controller
     public function index(Request $request)
     {
         $restaurantId = $request->user()->restaurant_id;
-        $shifts = \App\Models\Shift::where('restaurant_id', $restaurantId)
+        $shifts = Shift::where('restaurant_id', $restaurantId)
             ->with('user', 'employee')
             ->orderByDesc('shift_date')
-            ->paginate(15);
+            ->orderByDesc('id')
+            ->paginate($request->get('per_page', 15));
         return response()->json($shifts);
+    }
+
+    public function current(Request $request)
+    {
+        $user = $request->user();
+        $restaurantId = $user->restaurant_id;
+        $shift = Shift::where('restaurant_id', $restaurantId)
+            ->where('user_id', $user->id)
+            ->where('status', 'open')
+            ->latest('id')
+            ->first();
+
+        if (!$shift) {
+            return response()->json(['shift' => null]);
+        }
+
+        $ordersQuery = Order::where('restaurant_id', $restaurantId)
+            ->where('shift_id', $shift->id)
+            ->where(function ($q) use ($user) {
+                $q->where('cashier_id', $user->id)->orWhereNull('cashier_id');
+            });
+
+        $orders = $ordersQuery->where(function ($q) {
+            $q->where('payment_status', 'paid')->orWhere('status', 'completed');
+        })->get();
+
+        $total = $orders->sum(fn($o) => (float) $o->total_amount);
+        $byPayment = [
+            'cash' => 0,
+            'card' => 0,
+            'wallet' => 0,
+        ];
+        foreach ($orders as $order) {
+            $method = $order->payment_method ?? 'cash';
+            if (array_key_exists($method, $byPayment)) {
+                $byPayment[$method] += (float) $order->total_amount;
+            } elseif (isset($byPayment['cash'])) {
+                $byPayment['cash'] += (float) $order->total_amount;
+            }
+        }
+
+        return response()->json([
+            'shift' => $shift->load('user'),
+            'revenue' => [
+                'total' => round($total, 4),
+                'by_payment_method' => [
+                    'cash' => round($byPayment['cash'], 4),
+                    'card' => round($byPayment['card'], 4),
+                    'wallet' => round($byPayment['wallet'], 4),
+                ],
+            ],
+            'orders_count' => $orders->count(),
+        ]);
+    }
+
+    public function revenue(Request $request, Shift $shift)
+    {
+        if ($shift->restaurant_id !== $request->user()->restaurant_id) {
+            abort(403);
+        }
+
+        $orders = Order::where('restaurant_id', $shift->restaurant_id)
+            ->where('shift_id', $shift->id)
+            ->where(function ($q) {
+                $q->where('payment_status', 'paid')->orWhere('status', 'completed');
+            })
+            ->get();
+
+        $total = $orders->sum(fn($o) => (float) $o->total_amount);
+        $byPayment = ['cash' => 0, 'card' => 0, 'wallet' => 0];
+        foreach ($orders as $order) {
+            $method = $order->payment_method ?? 'cash';
+            if (array_key_exists($method, $byPayment)) {
+                $byPayment[$method] += (float) $order->total_amount;
+            }
+        }
+
+        return response()->json([
+            'total' => round($total, 4),
+            'by_payment_method' => array_map(fn($v) => round($v, 4), $byPayment),
+            'orders_count' => $orders->count(),
+        ]);
     }
 
     public function store(Request $request)
@@ -179,23 +265,42 @@ class ShiftController extends Controller
             'name' => 'required|string|max:100',
             'shift_date' => 'required|date',
             'start_time' => 'required|date_format:H:i',
-            'end_time' => 'required|date_format:H:i',
+            'end_time' => 'nullable|date_format:H:i',
             'status' => 'sometimes|in:open,closed',
             'opening_cash' => 'nullable|numeric|min:0',
             'expected_cash' => 'nullable|numeric|min:0',
             'notes' => 'nullable|string',
         ]);
-        $validated['restaurant_id'] = $request->user()->restaurant_id;
+
+        $restaurantId = $request->user()->restaurant_id;
+
+        // Close any existing open shift for this user before opening a new one.
+        Shift::where('restaurant_id', $restaurantId)
+            ->where('user_id', $validated['user_id'])
+            ->where('status', 'open')
+            ->update([
+                'status' => 'closed',
+                'closed_at' => now(),
+                'end_time' => now()->format('H:i'),
+            ]);
+
+        $validated['restaurant_id'] = $restaurantId;
         $validated['opening_cash'] = $validated['opening_cash'] ?? 0;
-        $validated['expected_cash'] = $validated['expected_cash'] ?? 0;
+        $validated['expected_cash'] = $validated['expected_cash'] ?? $validated['opening_cash'];
         $validated['actual_cash'] = 0;
         $validated['difference'] = 0;
         $validated['status'] = $validated['status'] ?? 'open';
-        $shift = \App\Models\Shift::create($validated);
+        $validated['start_time'] = \Carbon\Carbon::parse($validated['start_time'])->format('H:i:s');
+        if (!empty($validated['end_time'])) {
+            $validated['end_time'] = \Carbon\Carbon::parse($validated['end_time'])->format('H:i:s');
+        } else {
+            $validated['end_time'] = '23:59:00';
+        }
+        $shift = Shift::create($validated);
         return response()->json(['shift' => $shift->load('user'), 'message' => 'تم فتح الوردية'], 201);
     }
 
-    public function show(\App\Models\Shift $shift)
+    public function show(Shift $shift)
     {
         if ($shift->restaurant_id !== auth()->user()->restaurant_id) {
             abort(403);
@@ -203,7 +308,7 @@ class ShiftController extends Controller
         return response()->json(['shift' => $shift->load('user', 'employee')]);
     }
 
-    public function update(Request $request, \App\Models\Shift $shift)
+    public function update(Request $request, Shift $shift)
     {
         if ($shift->restaurant_id !== auth()->user()->restaurant_id) {
             abort(403);
@@ -212,18 +317,36 @@ class ShiftController extends Controller
             'actual_cash' => 'sometimes|numeric|min:0',
             'status' => 'sometimes|in:open,closed',
             'notes' => 'sometimes|string',
+            'end_time' => 'sometimes|date_format:H:i',
         ]);
-        if ($request->has('actual_cash')) {
-            $validated['difference'] = (float) $validated['actual_cash'] - (float) $shift->expected_cash;
-        }
         if ($request->has('status') && $request->status === 'closed') {
+            $cashRevenue = (float) Order::where('shift_id', $shift->id)
+                ->where('payment_method', 'cash')
+                ->where(function ($q) {
+                    $q->where('payment_status', 'paid')->orWhere('status', 'completed');
+                })
+                ->sum('total_amount');
+            $expected = (float) ($shift->opening_cash ?? 0) + $cashRevenue;
+            $validated['expected_cash'] = round($expected, 4);
+            if ($request->has('actual_cash')) {
+                $validated['difference'] = round((float) $validated['actual_cash'] - $expected, 4);
+            }
             $validated['closed_at'] = now();
+            if (empty($validated['end_time'])) {
+                $validated['end_time'] = now()->format('H:i:s');
+            }
+        } elseif ($request->has('actual_cash')) {
+            $expected = (float) ($shift->expected_cash ?? $shift->opening_cash ?? 0);
+            $validated['difference'] = (float) $validated['actual_cash'] - $expected;
+        }
+        if (isset($validated['end_time']) && is_string($validated['end_time']) && strlen($validated['end_time']) === 5) {
+            $validated['end_time'] = $validated['end_time'] . ':00';
         }
         $shift->update($validated);
-        return response()->json(['shift' => $shift->fresh(), 'message' => 'تم تحديث الوردية']);
+        return response()->json(['shift' => $shift->fresh()->load('user'), 'message' => 'تم تحديث الوردية']);
     }
 
-    public function destroy(\App\Models\Shift $shift)
+    public function destroy(Shift $shift)
     {
         if ($shift->restaurant_id !== auth()->user()->restaurant_id) {
             abort(403);

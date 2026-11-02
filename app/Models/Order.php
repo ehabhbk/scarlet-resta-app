@@ -17,6 +17,7 @@ class Order extends Model
         'customer_id',
         'cashier_id',
         'waiter_id',
+        'shift_id',
         'order_number',
         'type',
         'status',
@@ -76,6 +77,11 @@ class Order extends Model
     public function waiter(): BelongsTo
     {
         return $this->belongsTo(User::class, 'waiter_id');
+    }
+
+    public function shift(): BelongsTo
+    {
+        return $this->belongsTo(Shift::class);
     }
 
     public function items()

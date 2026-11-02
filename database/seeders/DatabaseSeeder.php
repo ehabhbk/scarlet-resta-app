@@ -101,7 +101,7 @@ class DatabaseSeeder extends Seeder
         $admin = \App\Models\User::create([
             'name' => 'المشرف العام',
             'email' => 'admin@scarletresta.com',
-            'password' => Hash::make('admin123'),
+            'password' => 'admin123',
             'restaurant_id' => $restaurant->id,
             'phone' => '+966500000001',
             'is_active' => true,

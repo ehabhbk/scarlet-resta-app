@@ -190,7 +190,7 @@ class DemoDataSeeder extends Seeder
                 ['email' => strtolower($jobTitle) . '@scarletresta.com'],
                 [
                     'name' => 'موظف ' . $jobTitle,
-                    'password' => Hash::make('password123'),
+                    'password' => 'password123',
                     'restaurant_id' => $restaurant->id,
                     'phone' => '+9665000001' . str_pad($idx + 1, 3, '0', STR_PAD_LEFT),
                     'is_active' => true,

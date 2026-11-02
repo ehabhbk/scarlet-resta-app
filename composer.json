@@ -33,6 +33,7 @@
         },
         "classmap": [
             "app/Models/Table.php",
+            "app/Models/KitchenStation.php",
             "app/Models/ProductSize.php",
             "app/Models/OrderItem.php",
             "app/Models/InventoryItem.php",

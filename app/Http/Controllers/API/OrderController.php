@@ -15,6 +15,7 @@ use App\Models\InventoryItem;
 use App\Models\StockMovement;
 use App\Models\Payment;
 use App\Models\Customer;
+use App\Http\Resources\OrderResource;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
@@ -41,7 +42,8 @@ class OrderController extends Controller
             $query->where('order_number', 'like', "%{$request->search}%");
         }
 
-        return response()->json($query->orderByDesc('created_at')->paginate(15));
+        $orders = $query->orderByDesc('created_at')->paginate(15);
+        return OrderResource::collection($orders);
     }
 
     public function store(Request $request)
@@ -49,6 +51,8 @@ class OrderController extends Controller
         $validated = $request->validate([
             'table_id' => 'nullable|exists:tables,id',
             'customer_id' => 'nullable|exists:customers,id',
+            'customer_name' => 'nullable|string|max:255',
+            'customer_phone' => 'nullable|string|max:50',
             'waiter_id' => 'nullable|exists:users,id',
             'type' => 'required|in:dine_in,takeaway,delivery',
             'payment_method' => 'required|in:cash,card,wallet',
@@ -120,12 +124,42 @@ class OrderController extends Controller
             $amountPaid = $validated['amount_paid'] ?? 0;
             $changeDue = max(0, $amountPaid - $totalAmount);
 
+            // Resolve / create the walk-in customer from the name entered at the POS.
+            $customerId = $validated['customer_id'] ?? null;
+            if (!$customerId && !empty($validated['customer_name'])) {
+                $customerQuery = Customer::where('restaurant_id', $restaurantId);
+                if (!empty($validated['customer_phone'])) {
+                    $customerQuery->where('phone', $validated['customer_phone']);
+                } else {
+                    $customerQuery->where('name', $validated['customer_name']);
+                }
+                $customer = $customerQuery->first();
+                if (!$customer) {
+                    $customer = Customer::create([
+                        'restaurant_id' => $restaurantId,
+                        'name' => $validated['customer_name'],
+                        'phone' => $validated['customer_phone'] ?? null,
+                        'customer_type' => 'regular',
+                        'is_active' => true,
+                    ]);
+                }
+                $customerId = $customer->id;
+            }
+
+            // Attach the sale to the cashier's currently open shift (if any).
+            $currentShift = \App\Models\Shift::where('restaurant_id', $restaurantId)
+                ->where('user_id', $user->id)
+                ->where('status', 'open')
+                ->latest('id')
+                ->first();
+
             $order = Order::create([
                 'restaurant_id' => $restaurantId,
                 'table_id' => $validated['table_id'] ?? null,
-                'customer_id' => $validated['customer_id'] ?? null,
+                'customer_id' => $customerId,
                 'cashier_id' => $user->id,
                 'waiter_id' => $validated['waiter_id'] ?? null,
+                'shift_id' => $currentShift?->id,
                 'order_number' => $orderNumber,
                 'type' => $validated['type'],
                 'status' => 'pending',
@@ -193,7 +227,7 @@ class OrderController extends Controller
             }
 
             // Update table status
-            if ($validated['table_id']) {
+            if (!empty($validated['table_id'])) {
                 $table = Table::find($validated['table_id']);
                 if ($table && $table->restaurant_id === $restaurantId) {
                     $table->update(['status' => 'occupied']);
@@ -201,8 +235,8 @@ class OrderController extends Controller
             }
 
             // Update customer stats
-            if ($validated['customer_id']) {
-                $customer = Customer::find($validated['customer_id']);
+            if ($customerId) {
+                $customer = Customer::find($customerId);
                 if ($customer && $customer->restaurant_id === $restaurantId) {
                     $customer->increment('total_orders');
                     $customer->increment('total_spent', $totalAmount);
@@ -218,6 +252,22 @@ class OrderController extends Controller
                 'notes' => 'طلب جديد',
             ]);
 
+            // Record the collected amount so reports/shift revenue have a payment row.
+            if ($amountPaid > 0) {
+                Payment::create([
+                    'restaurant_id' => $restaurantId,
+                    'paymentable_type' => Order::class,
+                    'paymentable_id' => $order->id,
+                    'amount' => $amountPaid,
+                    'method' => $validated['payment_method'],
+                    'reference' => null,
+                    'transaction_id' => null,
+                    'paid_at' => now(),
+                    'user_id' => $user->id,
+                    'notes' => 'دفعة عند إنشاء الطلب',
+                ]);
+            }
+
             return response()->json([
                 'order' => $order->load(['items.product', 'items.modifiers.modifierOption', 'table', 'customer', 'cashier']),
                 'message' => 'تم إنشاء الطلب بنجاح',
@@ -230,7 +280,8 @@ class OrderController extends Controller
         if ($order->restaurant_id !== auth()->user()->restaurant_id) {
             abort(403);
         }
-        return response()->json(['order' => $order->load(['items.product.sizes', 'items.modifiers.modifier', 'items.modifiers.modifierOption', 'table', 'customer', 'cashier', 'waiter', 'statusHistories.changedBy', 'payments'])]);
+        $order->load(['items.product.sizes', 'items.modifiers.modifier', 'items.modifiers.modifierOption', 'table', 'customer', 'cashier', 'waiter', 'statusHistories.changedBy', 'payments']);
+        return new OrderResource($order);
     }
 
     public function update(Request $request, Order $order)
