@@ -23,6 +23,7 @@ Route::prefix('auth')->group(function () {
 Route::middleware(['auth:sanctum', 'audit'])->prefix('auth')->group(function () {
     Route::post('logout', [\App\Http\Controllers\API\AuthController::class, 'logout']);
     Route::get('me', [\App\Http\Controllers\API\AuthController::class, 'me']);
+    Route::post('avatar', [\App\Http\Controllers\API\AuthController::class, 'uploadAvatar']);
     Route::get('restaurant', [\App\Http\Controllers\API\AuthController::class, 'restaurant']);
     Route::put('restaurant', [\App\Http\Controllers\API\RestaurantController::class, 'update']);
     Route::post('restaurant/logo', [\App\Http\Controllers\API\RestaurantController::class, 'uploadLogo']);
@@ -46,8 +47,8 @@ Route::middleware(['auth:sanctum', 'audit'])->apiResource('categories', \App\Htt
 Route::middleware(['auth:sanctum', 'audit'])->get('categories/tree', [\App\Http\Controllers\API\CategoryController::class, 'tree']);
 
 // Products
-Route::middleware(['auth:sanctum', 'audit'])->apiResource('products', \App\Http\Controllers\API\ProductController::class);
 Route::middleware(['auth:sanctum', 'audit'])->get('products/available', [\App\Http\Controllers\API\ProductController::class, 'available']);
+Route::middleware(['auth:sanctum', 'audit'])->apiResource('products', \App\Http\Controllers\API\ProductController::class);
 Route::middleware(['auth:sanctum', 'audit'])->get('products/{product}/sizes', [\App\Http\Controllers\API\ProductController::class, 'sizes']);
 Route::middleware(['auth:sanctum', 'audit'])->get('products/{product}/modifiers', [\App\Http\Controllers\API\ProductController::class, 'modifiers']);
 Route::middleware(['auth:sanctum', 'audit'])->post('products/{product}/image', [\App\Http\Controllers\API\ProductController::class, 'uploadImage']);

@@ -13,7 +13,7 @@ class RestaurantController extends Controller
     {
         $restaurant = $request->user()->restaurant;
         if (!$restaurant) {
-            abort(404, 'المطرب غير موجود');
+            abort(404, 'المطعم غير موجود');
         }
         return response()->json(['restaurant' => $restaurant]);
     }
@@ -35,7 +35,7 @@ class RestaurantController extends Controller
             'logo' => 'sometimes|nullable|string',
         ]);
         $restaurant->update($validated);
-        return response()->json(['restaurant' => $restaurant->fresh(), 'message' => 'تم تحديث بيانات المطرب']);
+        return response()->json(['restaurant' => $restaurant->fresh(), 'message' => 'تم تحديث بيانات المطعم']);
     }
 
     public function uploadLogo(Request $request)

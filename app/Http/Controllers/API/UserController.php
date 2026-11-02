@@ -7,6 +7,7 @@ use App\Models\User;
 use Spatie\Permission\Models\Role;
 use Spatie\Permission\Models\Permission;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Storage;
 
 class UserController extends Controller
 {
@@ -29,9 +30,14 @@ class UserController extends Controller
             'phone' => 'nullable|string|max:50',
             'role' => 'required|string',
             'is_active' => 'boolean',
+            'image_file' => 'nullable|image|mimes:jpeg,png,jpg,gif,webp|max:2048',
         ]);
         $validated['restaurant_id'] = $request->user()->restaurant_id;
         $validated['password'] = \Illuminate\Support\Facades\Hash::make($validated['password']);
+        if ($request->hasFile('image_file')) {
+            $validated['avatar'] = Storage::disk('public')->url($request->file('image_file')->store('users', 'public'));
+        }
+        unset($validated['image_file']);
         $user = User::create($validated);
         $roleName = $validated['role'];
         $role = Role::where('name', $roleName)->where('guard_name', 'sanctum')->first();
@@ -58,12 +64,21 @@ class UserController extends Controller
             'name' => 'sometimes|string|max:255',
             'username' => 'sometimes|string|max:100|unique:users,username,' . $user->id,
             'password' => 'sometimes|string|min:6',
+            'phone' => 'sometimes|nullable|string|max:50',
             'role' => 'sometimes|string',
             'is_active' => 'sometimes|boolean',
+            'image_file' => 'sometimes|image|mimes:jpeg,png,jpg,gif,webp|max:2048',
         ]);
         if ($request->has('password')) {
             $validated['password'] = \Illuminate\Support\Facades\Hash::make($validated['password']);
         }
+        if ($request->hasFile('image_file')) {
+            if ($user->avatar && str_contains($user->avatar, '/storage/')) {
+                Storage::disk('public')->delete(substr($user->avatar, strpos($user->avatar, '/storage/') + 9));
+            }
+            $validated['avatar'] = Storage::disk('public')->url($request->file('image_file')->store('users', 'public'));
+        }
+        unset($validated['image_file']);
         $user->update($validated);
         if ($request->has('role')) {
             $user->syncRoles([$request->role]);

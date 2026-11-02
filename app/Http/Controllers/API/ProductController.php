@@ -7,6 +7,7 @@ use App\Models\Product;
 use App\Models\Category;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Storage;
 use App\Http\Services\ProductService;
 use App\Http\Requests\Product\StoreProductRequest;
 use App\Http\Resources\ProductResource;
@@ -51,6 +52,9 @@ class ProductController extends Controller
         $validated['slug'] = $validated['slug'] ?? \Illuminate\Support\Str::slug($validated['name']);
         $validated['track_inventory'] = $request->boolean('track_inventory', true);
         $validated['is_available'] = $request->boolean('is_available', true);
+        if ($request->hasFile('image_file')) {
+            $validated['image'] = Storage::disk('public')->url($request->file('image_file')->store('products', 'public'));
+        }
 
         $product = $this->service->create($validated);
 
@@ -79,9 +83,23 @@ class ProductController extends Controller
             'sale_price' => 'sometimes|numeric|min:0',
             'cost_price' => 'sometimes|numeric|min:0',
             'is_available' => 'sometimes|boolean',
+            'description' => 'sometimes|nullable|string',
+            'tax_rate' => 'sometimes|nullable|numeric|min:0|max:1',
+            'track_inventory' => 'sometimes|boolean',
+            'current_stock' => 'sometimes|integer|min:0',
+            'min_stock' => 'sometimes|integer|min:0',
+            'is_featured' => 'sometimes|boolean',
+            'is_best_seller' => 'sometimes|boolean',
+            'sort_order' => 'sometimes|integer|min:0',
+            'image_file' => 'sometimes|nullable|image|mimes:jpeg,png,jpg,gif,webp|max:2048',
         ]);
 
-        $product->update($validated);
+        if ($request->hasFile('image_file')) {
+            $this->deleteStoredImage($product->image);
+            $validated['image'] = Storage::disk('public')->url($request->file('image_file')->store('products', 'public'));
+        }
+        unset($validated['image_file']);
+        $this->service->update($product, $validated);
 
         return response()->json(['product' => $product->fresh(), 'message' => 'تم تحديث المنتج بنجاح']);
     }
@@ -124,14 +142,19 @@ class ProductController extends Controller
             'image' => 'required|image|mimes:jpeg,png,jpg,gif,webp|max:2048',
         ]);
         if ($request->hasFile('image')) {
-            $file = $request->file('image');
-            $filename = 'products/' . $product->id . '_' . time() . '.' . $file->getClientOriginalExtension();
-            $path = $file->storeAs('public', $filename);
-            $url = '/storage/' . $filename;
+            $this->deleteStoredImage($product->image);
+            $url = Storage::disk('public')->url($request->file('image')->store('products', 'public'));
             $product->update(['image' => $url]);
             return response()->json(['image' => $url, 'message' => 'تم رفع الصورة']);
         }
         return response()->json(['message' => 'لم يتم رفع ملف'], 400);
+    }
+
+    protected function deleteStoredImage(?string $url): void
+    {
+        if ($url && str_contains($url, '/storage/')) {
+            Storage::disk('public')->delete(substr($url, strpos($url, '/storage/') + 9));
+        }
     }
 
     protected function authorizeRestaurant($model)

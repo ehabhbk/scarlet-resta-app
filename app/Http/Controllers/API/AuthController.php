@@ -8,6 +8,7 @@ use App\Http\Resources\UserResource;
 use App\Models\User;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Storage;
 
 class AuthController extends Controller
 {
@@ -79,11 +80,30 @@ class AuthController extends Controller
         ]);
     }
 
+    public function uploadAvatar(Request $request)
+    {
+        $request->validate([
+            'image' => 'required|image|mimes:jpeg,png,jpg,gif,webp|max:2048',
+        ]);
+        $user = $request->user();
+        if ($user->avatar && str_contains($user->avatar, '/storage/')) {
+            Storage::disk('public')->delete(substr($user->avatar, strpos($user->avatar, '/storage/') + 9));
+        }
+        $user->update([
+            'avatar' => Storage::disk('public')->url($request->file('image')->store('users', 'public')),
+        ]);
+
+        return response()->json([
+            'user' => new UserResource($user->fresh()->load('restaurant', 'roles')),
+            'message' => 'تم تحديث الصورة الشخصية',
+        ]);
+    }
+
     public function restaurant(Request $request)
     {
         $restaurant = $request->user()->restaurant;
         if (!$restaurant) {
-            return response()->json(['message' => 'لا يوجد مطرب مرتبط بالمستخدم'], 404);
+            return response()->json(['message' => 'لا يوجد مطعم مرتبط بالمستخدم'], 404);
         }
         return response()->json(['restaurant' => $restaurant]);
     }

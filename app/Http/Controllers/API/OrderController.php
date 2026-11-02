@@ -27,7 +27,10 @@ class OrderController extends Controller
     {
         $restaurantId = $request->user()->restaurant_id;
         $query = Order::where('restaurant_id', $restaurantId)
-            ->with(['table', 'customer', 'cashier', 'waiter', 'items.product', 'payments']);
+            ->with([
+                'table', 'customer', 'cashier', 'waiter', 'payments',
+                'items.product', 'items.size', 'items.modifiers.modifier', 'items.modifiers.modifierOption',
+            ]);
 
         if ($request->has('status')) {
             $query->where('status', $request->status);
@@ -38,11 +41,15 @@ class OrderController extends Controller
         if ($request->has('table_id')) {
             $query->where('table_id', $request->table_id);
         }
+        if ($request->filled('shift_id')) {
+            $query->where('shift_id', $request->integer('shift_id'));
+        }
         if ($request->has('search')) {
             $query->where('order_number', 'like', "%{$request->search}%");
         }
 
-        $orders = $query->orderByDesc('created_at')->paginate(15);
+        $perPage = min(max($request->integer('per_page', 15), 1), 100);
+        $orders = $query->orderByDesc('created_at')->paginate($perPage);
         return OrderResource::collection($orders);
     }
 
@@ -55,7 +62,7 @@ class OrderController extends Controller
             'customer_phone' => 'nullable|string|max:50',
             'waiter_id' => 'nullable|exists:users,id',
             'type' => 'required|in:dine_in,takeaway,delivery',
-            'payment_method' => 'required|string|max:50',
+            'payment_method' => 'required|in:cash,card,wallet,bank_transfer,cheque',
             'discount_amount' => 'nullable|numeric|min:0',
             'discount_percent' => 'nullable|numeric|min:0|max:100',
             'delivery_fee' => 'nullable|numeric|min:0',
@@ -92,18 +99,9 @@ class OrderController extends Controller
 
             // Calculate totals from product prices (server-side, never trust client prices)
             foreach ($validated['items'] as $item) {
-                $product = Product::findOrFail($item['product_id']);
-                if ($product->restaurant_id !== $restaurantId) {
-                    abort(403, 'منتج غير تابع لهذا المطرب');
-                }
-                $unitPrice = $product->sale_price;
-                if (!empty($item['size_id'])) {
-                    $size = $product->sizes()->find($item['size_id']);
-                    if ($size) {
-                        $unitPrice += $size->price_modifier;
-                    }
-                }
-                $subtotal += $unitPrice * $item['quantity'];
+                $product = Product::where('restaurant_id', $restaurantId)
+                    ->findOrFail($item['product_id']);
+                $subtotal += $this->calculateItemPrice($product, $item) * $item['quantity'];
             }
 
             $discountAmount = $validated['discount_amount'] ?? 0;
@@ -182,14 +180,9 @@ class OrderController extends Controller
             // Order items + modifiers
             $sort = 0;
             foreach ($validated['items'] as $itemData) {
-                $product = Product::find($itemData['product_id']);
-                $unitPrice = $product->sale_price;
-                if (!empty($itemData['size_id'])) {
-                    $size = $product->sizes()->find($itemData['size_id']);
-                    if ($size) {
-                        $unitPrice += $size->price_modifier;
-                    }
-                }
+                $product = Product::where('restaurant_id', $restaurantId)
+                    ->findOrFail($itemData['product_id']);
+                $unitPrice = $this->calculateItemPrice($product, $itemData);
                 $itemDiscount = 0;
                 $itemTax = 0;
                 $itemTotal = ($unitPrice * $itemData['quantity']) - $itemDiscount + $itemTax;
@@ -211,13 +204,12 @@ class OrderController extends Controller
                 // Modifiers
                 if (!empty($itemData['modifier_options'])) {
                     foreach ($itemData['modifier_options'] as $modOpt) {
-                        $option = \App\Models\ModifierOption::find($modOpt['modifier_option_id']);
-                        $priceMod = $option ? $option->price_modifier : 0;
+                        $option = \App\Models\ModifierOption::findOrFail($modOpt['modifier_option_id']);
                         OrderItemModifier::create([
                             'order_item_id' => $orderItem->id,
                             'modifier_id' => $modOpt['modifier_id'],
                             'modifier_option_id' => $modOpt['modifier_option_id'],
-                            'price_modifier' => $priceMod,
+                            'price_modifier' => $option->price_modifier,
                         ]);
                     }
                 }
@@ -292,14 +284,144 @@ class OrderController extends Controller
         if ($order->restaurant_id !== auth()->user()->restaurant_id) {
             abort(403);
         }
+        if (in_array($order->status, ['cancelled'], true) || $order->payment_status === 'refunded') {
+            return response()->json(['message' => 'لا يمكن تعديل طلب ملغي أو مسترد'], 400);
+        }
         $validated = $request->validate([
             'notes' => 'nullable|string',
             'customer_notes' => 'nullable|string',
             'discount_amount' => 'nullable|numeric|min:0',
-            'payment_method' => 'sometimes|string|max:50',
+            'discount_percent' => 'sometimes|numeric|min:0|max:100',
+            'payment_method' => 'sometimes|in:cash,card,wallet,bank_transfer,cheque',
+            'amount_received' => 'sometimes|numeric|min:0',
+            'items' => 'sometimes|array|min:1',
+            'items.*.product_id' => 'required_with:items|integer|exists:products,id',
+            'items.*.size_id' => 'nullable|integer|exists:product_sizes,id',
+            'items.*.quantity' => 'required_with:items|integer|min:1',
+            'items.*.notes' => 'nullable|string',
+            'items.*.modifier_options' => 'nullable|array',
+            'items.*.modifier_options.*.modifier_id' => 'required|integer|exists:product_modifiers,id',
+            'items.*.modifier_options.*.modifier_option_id' => 'required|integer|exists:modifier_options,id',
         ]);
-        $order->update($validated);
-        return response()->json(['order' => $order->fresh(), 'message' => 'تم تحديث الطلب']);
+
+        return DB::transaction(function () use ($validated, $request, $order) {
+            $updates = collect($validated)->except(['items', 'amount_received'])->all();
+            if (isset($validated['items'])) {
+                $user = $request->user();
+                $restaurant = $user->restaurant;
+                $oldSubtotal = (float) $order->subtotal;
+                $discountPercent = $validated['discount_percent'] ?? (float) $order->discount_percent;
+                $fixedDiscount = isset($validated['discount_amount'])
+                    ? (float) $validated['discount_amount']
+                    : max(0, (float) $order->discount_amount - ($oldSubtotal * (float) $order->discount_percent / 100));
+
+                foreach ($order->items as $oldItem) {
+                    $this->restoreInventoryForProduct($oldItem->product_id, $oldItem->quantity, $user->id, $order->id);
+                    Product::whereKey($oldItem->product_id)
+                        ->where('sales_count', '>=', $oldItem->quantity)
+                        ->decrement('sales_count', $oldItem->quantity);
+                    $oldItem->modifiers()->delete();
+                    $oldItem->delete();
+                }
+
+                $subtotal = 0;
+                foreach ($validated['items'] as $sort => $itemData) {
+                    $product = Product::where('restaurant_id', $order->restaurant_id)
+                        ->where('is_available', true)
+                        ->findOrFail($itemData['product_id']);
+                    $unitPrice = $this->calculateItemPrice($product, $itemData);
+                    $quantity = $itemData['quantity'];
+                    $subtotal += $unitPrice * $quantity;
+
+                    $item = $order->items()->create([
+                        'product_id' => $product->id,
+                        'size_id' => $itemData['size_id'] ?? null,
+                        'quantity' => $quantity,
+                        'unit_price' => $unitPrice,
+                        'discount_amount' => 0,
+                        'tax_amount' => 0,
+                        'total_price' => $unitPrice * $quantity,
+                        'notes' => $itemData['notes'] ?? null,
+                        'kitchen_status' => 'pending',
+                        'sort_order' => $sort,
+                    ]);
+
+                    foreach ($itemData['modifier_options'] ?? [] as $modifierOption) {
+                        $option = \App\Models\ModifierOption::findOrFail($modifierOption['modifier_option_id']);
+                        OrderItemModifier::create([
+                            'order_item_id' => $item->id,
+                            'modifier_id' => $modifierOption['modifier_id'],
+                            'modifier_option_id' => $option->id,
+                            'price_modifier' => $option->price_modifier,
+                        ]);
+                    }
+
+                    $this->deductInventoryForProduct($product->id, $quantity, $user->id, $order->id);
+                    $product->increment('sales_count', $quantity);
+                }
+
+                $discount = min($subtotal, $fixedDiscount + ($subtotal * $discountPercent / 100));
+                $taxRate = (float) ($restaurant?->tax_rate ?? 0);
+                $tax = ($subtotal - $discount) * $taxRate;
+                $total = $subtotal - $discount + $tax + (float) $order->delivery_fee;
+                $paid = max(0, (float) $order->amount_paid - (float) $order->change_due);
+                $amountPaid = $paid;
+                $changeDue = 0;
+                $method = $validated['payment_method'] ?? $order->payment_method ?? 'cash';
+
+                if ($paid > $total) {
+                    $refundAmount = $paid - $total;
+                    Payment::create([
+                        'restaurant_id' => $order->restaurant_id,
+                        'paymentable_type' => Order::class,
+                        'paymentable_id' => $order->id,
+                        'amount' => -$refundAmount,
+                        'method' => $method,
+                        'paid_at' => now(),
+                        'user_id' => $user->id,
+                        'notes' => 'استرداد فرق تعديل أصناف الطلب',
+                    ]);
+                    $paid = $total;
+                    $amountPaid = $total;
+                } elseif ($paid < $total && (float) ($validated['amount_received'] ?? 0) > 0) {
+                    $received = (float) $validated['amount_received'];
+                    Payment::create([
+                        'restaurant_id' => $order->restaurant_id,
+                        'paymentable_type' => Order::class,
+                        'paymentable_id' => $order->id,
+                        'amount' => $received,
+                        'method' => $method,
+                        'paid_at' => now(),
+                        'user_id' => $user->id,
+                        'notes' => 'دفعة فرق تعديل أصناف الطلب',
+                    ]);
+                    $amountPaid += $received;
+                    $changeDue = max(0, $amountPaid - $total);
+                    $paid = min($amountPaid, $total);
+                }
+
+                $updates = array_merge($updates, [
+                    'subtotal' => $subtotal,
+                    'discount_amount' => $discount,
+                    'discount_percent' => $discountPercent,
+                    'tax_amount' => $tax,
+                    'total_amount' => $total,
+                    'amount_paid' => $amountPaid,
+                    'change_due' => $changeDue,
+                    'payment_status' => $paid >= $total ? 'paid' : ($paid > 0 ? 'partial' : 'unpaid'),
+                    'payment_method' => $method,
+                ]);
+            }
+
+            $order->update($updates);
+            return response()->json([
+                'order' => new OrderResource($order->fresh()->load([
+                    'items.product', 'items.size', 'items.modifiers.modifier',
+                    'items.modifiers.modifierOption', 'payments', 'table', 'customer', 'cashier', 'waiter',
+                ])),
+                'message' => 'تم تحديث الطلب',
+            ]);
+        });
     }
 
     public function destroy(Order $order)
@@ -310,6 +432,20 @@ class OrderController extends Controller
         if ($order->status === 'completed') {
             return response()->json(['message' => 'لا يمكن حذف طلب مكتمل'], 400);
         }
+        if ((float) $order->amount_paid > 0) {
+            return response()->json(['message' => 'استرداد قيمة الطلب قبل حذفه'], 400);
+        }
+        if ($order->status !== 'cancelled' && $order->payment_status !== 'refunded') {
+            foreach ($order->items as $item) {
+                $this->restoreInventoryForProduct($item->product_id, $item->quantity, auth()->id(), $order->id);
+                Product::whereKey($item->product_id)
+                    ->where('sales_count', '>=', $item->quantity)
+                    ->decrement('sales_count', $item->quantity);
+            }
+        }
+        if ($order->table_id) {
+            Table::whereKey($order->table_id)->update(['status' => 'available']);
+        }
         $order->delete();
         return response()->json(['message' => 'تم حذف الطلب']);
     }
@@ -319,31 +455,50 @@ class OrderController extends Controller
         if ($order->restaurant_id !== auth()->user()->restaurant_id) {
             abort(403);
         }
-        if ($order->payment_status !== 'paid') {
+        $refundableAmount = max(0, (float) $order->amount_paid - (float) $order->change_due);
+        if (!in_array($order->payment_status, ['paid', 'partial'], true) || $refundableAmount <= 0) {
             return response()->json(['message' => 'لا يمكن استرجاع دفع غير مدفوع'], 400);
         }
         $user = $request->user();
         $validated = $request->validate(['reason' => 'nullable|string']);
-        return DB::transaction(function () use ($order, $user, $validated) {
-            foreach ($order->items as $item) {
-                $this->restoreInventoryForProduct($item->product_id, $item->quantity, $user->id, $order->id);
-                Product::where('id', $item->product_id)
-                    ->where('sales_count', '>=', $item->quantity)
-                    ->decrement('sales_count', $item->quantity);
+        return DB::transaction(function () use ($order, $user, $validated, $refundableAmount) {
+            if ($order->payment_status === 'refunded') {
+                return response()->json(['message' => 'تم استرداد هذا الطلب مسبقاً'], 400);
             }
-            if ($order->table_id) {
-                Table::where('id', $order->table_id)->update(['status' => 'available']);
+            $oldStatus = $order->status;
+            if ($oldStatus !== 'cancelled') {
+                foreach ($order->items as $item) {
+                    $this->restoreInventoryForProduct($item->product_id, $item->quantity, $user->id, $order->id);
+                    Product::where('id', $item->product_id)
+                        ->where('sales_count', '>=', $item->quantity)
+                        ->decrement('sales_count', $item->quantity);
+                }
+                if ($order->table_id) {
+                    Table::where('id', $order->table_id)->update(['status' => 'available']);
+                }
             }
+            $refundAmount = $refundableAmount;
             $order->update([
                 'status' => 'cancelled',
                 'payment_status' => 'refunded',
+                'amount_paid' => 0,
                 'cancelled_at' => now(),
                 'cancelled_by' => $user->id,
                 'cancellation_reason' => $validated['reason'] ?? 'استرجاع',
             ]);
+            Payment::create([
+                'restaurant_id' => $order->restaurant_id,
+                'paymentable_type' => Order::class,
+                'paymentable_id' => $order->id,
+                'amount' => -$refundAmount,
+                'method' => $order->payment_method ?: 'cash',
+                'paid_at' => now(),
+                'user_id' => $user->id,
+                'notes' => 'استرداد كامل للطلب: ' . ($validated['reason'] ?? ''),
+            ]);
             OrderStatusHistory::create([
                 'order_id' => $order->id,
-                'old_status' => $order->getOriginal('status'),
+                'old_status' => $oldStatus,
                 'new_status' => 'cancelled',
                 'changed_by' => $user->id,
                 'notes' => 'استرجاع دفع: ' . ($validated['reason'] ?? 'بدون سبب'),
@@ -472,6 +627,7 @@ class OrderController extends Controller
         if (!$recipe) {
             return;
         }
+
         foreach ($recipe->ingredients as $ingredient) {
             $needed = (float) $ingredient->quantity * (float) $qty;
             $item = InventoryItem::find($ingredient->inventory_item_id);
@@ -492,6 +648,34 @@ class OrderController extends Controller
                 'notes' => "صرف لوصفة منتج #{$productId}",
             ]);
         }
+    }
+
+    protected function calculateItemPrice(Product $product, array $item): float
+    {
+        $price = (float) $product->sale_price;
+
+        if (!empty($item['size_id'])) {
+            $size = $product->sizes()->whereKey($item['size_id'])->first();
+            if (!$size) {
+                abort(422, 'المقاس المحدد لا يتبع المنتج');
+            }
+            $price += (float) $size->price_modifier;
+        }
+
+        foreach ($item['modifier_options'] ?? [] as $modifierOption) {
+            $modifier = \App\Models\ProductModifier::where('product_id', $product->id)
+                ->whereKey($modifierOption['modifier_id'])
+                ->first();
+            $option = \App\Models\ModifierOption::where('modifier_id', $modifierOption['modifier_id'])
+                ->whereKey($modifierOption['modifier_option_id'])
+                ->first();
+            if (!$modifier || !$option) {
+                abort(422, 'الإضافة المحددة لا تتبع المنتج');
+            }
+            $price += (float) $option->price_modifier;
+        }
+
+        return $price;
     }
 
     protected function restoreInventoryForProduct($productId, $qty, $userId, $orderId)

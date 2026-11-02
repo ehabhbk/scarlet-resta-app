@@ -11,6 +11,8 @@ class OrderItemResource extends JsonResource
     {
         return [
             'id' => $this->id,
+            'product_id' => $this->product_id,
+            'size_id' => $this->size_id,
             'product' => $this->whenLoaded('product', fn() => $this->product ? [
                 'id' => $this->product->id,
                 'name' => $this->product->name,
@@ -29,6 +31,8 @@ class OrderItemResource extends JsonResource
             'kitchen_status' => $this->kitchen_status,
             'modifiers' => $this->whenLoaded('modifiers', fn() => $this->modifiers->map(fn($m) => [
                 'id' => $m->id,
+                'modifier_id' => $m->modifier_id,
+                'modifier_option_id' => $m->modifier_option_id,
                 'modifier' => $m->modifier?->name,
                 'option' => $m->modifierOption?->name,
                 'price_modifier' => (float) $m->price_modifier,
