@@ -48,7 +48,7 @@ class OrderWorkflowTest extends TestCase
             ->assertOk()
             ->assertJsonPath('data.0.id', $order->id)
             ->assertJsonPath('data.0.shift_id', $shift->id)
-            ->assertJsonPath('data.0.items.0.product.image', '/storage/products/tea.jpg');
+            ->assertJsonPath('data.0.items.0.product.image', route('media.show', ['path' => 'products/tea.jpg']));
     }
 
     public function test_replacing_order_items_refunds_the_price_difference(): void

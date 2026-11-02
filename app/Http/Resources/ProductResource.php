@@ -2,6 +2,7 @@
 
 namespace App\Http\Resources;
 
+use App\Support\PublicMediaUrl;
 use Illuminate\Http\Request;
 use Illuminate\Http\Resources\Json\JsonResource;
 
@@ -16,7 +17,7 @@ class ProductResource extends JsonResource
             'sku' => $this->sku,
             'barcode' => $this->barcode,
             'description' => $this->description,
-            'image' => $this->image,
+            'image' => PublicMediaUrl::make($this->image),
             'sale_price' => (float) $this->sale_price,
             'cost_price' => (float) $this->cost_price,
             'tax_rate' => $this->tax_rate ? (float) $this->tax_rate : null,

@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\API;
 
 use App\Http\Controllers\Controller;
+use App\Support\PublicMediaUrl;
 use App\Models\Order;
 use App\Models\Product;
 use App\Models\Expense;
@@ -119,7 +120,7 @@ class DashboardController extends Controller
                 'sales_count' => (int) $row->sales_count,
                 'revenue' => (float) $row->revenue,
                 'sale_price' => (float) $product->sale_price,
-                'image' => $product->image,
+                'image' => PublicMediaUrl::make($product->image),
             ];
         })->filter()->values();
 

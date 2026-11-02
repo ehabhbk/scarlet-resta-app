@@ -2,6 +2,7 @@
 
 namespace App\Http\Resources;
 
+use App\Support\PublicMediaUrl;
 use Illuminate\Http\Request;
 use Illuminate\Http\Resources\Json\JsonResource;
 
@@ -16,7 +17,7 @@ class OrderItemResource extends JsonResource
             'product' => $this->whenLoaded('product', fn() => $this->product ? [
                 'id' => $this->product->id,
                 'name' => $this->product->name,
-                'image' => $this->product->image,
+                'image' => PublicMediaUrl::make($this->product->image),
             ] : null),
             'size' => $this->whenLoaded('size', fn() => $this->size ? [
                 'id' => $this->size->id,

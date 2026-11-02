@@ -5,6 +5,7 @@ namespace App\Http\Controllers\API;
 use App\Http\Controllers\Controller;
 use App\Models\Product;
 use App\Models\Category;
+use App\Support\PublicMediaUrl;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
@@ -53,7 +54,7 @@ class ProductController extends Controller
         $validated['track_inventory'] = $request->boolean('track_inventory', true);
         $validated['is_available'] = $request->boolean('is_available', true);
         if ($request->hasFile('image_file')) {
-            $validated['image'] = Storage::disk('public')->url($request->file('image_file')->store('products', 'public'));
+            $validated['image'] = $request->file('image_file')->store('products', 'public');
         }
 
         $product = $this->service->create($validated);
@@ -96,12 +97,15 @@ class ProductController extends Controller
 
         if ($request->hasFile('image_file')) {
             $this->deleteStoredImage($product->image);
-            $validated['image'] = Storage::disk('public')->url($request->file('image_file')->store('products', 'public'));
+            $validated['image'] = $request->file('image_file')->store('products', 'public');
         }
         unset($validated['image_file']);
         $this->service->update($product, $validated);
 
-        return response()->json(['product' => $product->fresh(), 'message' => 'تم تحديث المنتج بنجاح']);
+        $updated = $product->fresh();
+        $updated->image = PublicMediaUrl::make($updated->image);
+
+        return response()->json(['product' => $updated, 'message' => 'تم تحديث المنتج بنجاح']);
     }
 
     public function destroy(Product $product)
@@ -120,7 +124,12 @@ class ProductController extends Controller
             ->orderBy('sort_order')
             ->get();
 
-        return response()->json(['products' => $products]);
+        return response()->json([
+            'products' => $products->map(function (Product $product) {
+                $product->image = PublicMediaUrl::make($product->image);
+                return $product;
+            }),
+        ]);
     }
 
     public function sizes(Product $product)
@@ -143,17 +152,18 @@ class ProductController extends Controller
         ]);
         if ($request->hasFile('image')) {
             $this->deleteStoredImage($product->image);
-            $url = Storage::disk('public')->url($request->file('image')->store('products', 'public'));
-            $product->update(['image' => $url]);
-            return response()->json(['image' => $url, 'message' => 'تم رفع الصورة']);
+            $path = $request->file('image')->store('products', 'public');
+            $product->update(['image' => $path]);
+            return response()->json(['image' => PublicMediaUrl::make($path), 'message' => 'تم رفع الصورة']);
         }
         return response()->json(['message' => 'لم يتم رفع ملف'], 400);
     }
 
     protected function deleteStoredImage(?string $url): void
     {
-        if ($url && str_contains($url, '/storage/')) {
-            Storage::disk('public')->delete(substr($url, strpos($url, '/storage/') + 9));
+        $path = PublicMediaUrl::storagePath($url);
+        if ($path) {
+            Storage::disk('public')->delete($path);
         }
     }
 

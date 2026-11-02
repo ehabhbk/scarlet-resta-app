@@ -2,6 +2,20 @@
 
 use Illuminate\Support\Facades\Route;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Storage;
+
+Route::get('media/{path}', function (string $path) {
+    abort_unless(
+        preg_match('~^(?:products|users|logos)/[A-Za-z0-9._/-]+$~', $path) && !str_contains($path, '..'),
+        404
+    );
+    abort_unless(Storage::disk('public')->exists($path), 404);
+
+    return Storage::disk('public')->response($path, null, [
+        'Cache-Control' => 'public, max-age=86400',
+        'X-Content-Type-Options' => 'nosniff',
+    ]);
+})->where('path', '.*')->name('media.show');
 
 /*
 |--------------------------------------------------------------------------

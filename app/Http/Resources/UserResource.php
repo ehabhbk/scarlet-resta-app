@@ -2,6 +2,7 @@
 
 namespace App\Http\Resources;
 
+use App\Support\PublicMediaUrl;
 use Illuminate\Http\Request;
 use Illuminate\Http\Resources\Json\JsonResource;
 
@@ -15,7 +16,7 @@ class UserResource extends JsonResource
             'username' => $this->username,
             'email' => $this->email,
             'phone' => $this->phone,
-            'avatar' => $this->avatar,
+            'avatar' => PublicMediaUrl::make($this->avatar),
             'is_active' => (bool) $this->is_active,
             'roles' => $this->whenLoaded('roles', fn() => $this->roles->map(fn($r) => [
                 'id' => $r->id,
@@ -29,7 +30,7 @@ class UserResource extends JsonResource
                 'currency' => $this->restaurant->currency,
                 'symbol' => $this->restaurant->symbol,
                 'tax_rate' => (float) $this->restaurant->tax_rate,
-                'logo' => $this->restaurant->logo,
+                'logo' => PublicMediaUrl::make($this->restaurant->logo),
             ] : null),
             'created_at' => $this->created_at?->toISOString(),
             'updated_at' => $this->updated_at?->toISOString(),

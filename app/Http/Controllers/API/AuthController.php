@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Http\Requests\Auth\LoginRequest;
 use App\Http\Resources\UserResource;
 use App\Models\User;
+use App\Support\PublicMediaUrl;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Storage;
@@ -86,11 +87,12 @@ class AuthController extends Controller
             'image' => 'required|image|mimes:jpeg,png,jpg,gif,webp|max:2048',
         ]);
         $user = $request->user();
-        if ($user->avatar && str_contains($user->avatar, '/storage/')) {
-            Storage::disk('public')->delete(substr($user->avatar, strpos($user->avatar, '/storage/') + 9));
+        $oldAvatarPath = PublicMediaUrl::storagePath($user->avatar);
+        if ($oldAvatarPath) {
+            Storage::disk('public')->delete($oldAvatarPath);
         }
         $user->update([
-            'avatar' => Storage::disk('public')->url($request->file('image')->store('users', 'public')),
+            'avatar' => $request->file('image')->store('users', 'public'),
         ]);
 
         return response()->json([
@@ -105,6 +107,9 @@ class AuthController extends Controller
         if (!$restaurant) {
             return response()->json(['message' => 'لا يوجد مطعم مرتبط بالمستخدم'], 404);
         }
-        return response()->json(['restaurant' => $restaurant]);
+        $data = $restaurant->toArray();
+        $data['logo'] = PublicMediaUrl::make($restaurant->logo);
+
+        return response()->json(['restaurant' => $data]);
     }
 }

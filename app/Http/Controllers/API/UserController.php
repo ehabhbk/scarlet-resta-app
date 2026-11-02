@@ -3,7 +3,9 @@
 namespace App\Http\Controllers\API;
 
 use App\Http\Controllers\Controller;
+use App\Http\Resources\UserResource;
 use App\Models\User;
+use App\Support\PublicMediaUrl;
 use Spatie\Permission\Models\Role;
 use Spatie\Permission\Models\Permission;
 use Illuminate\Http\Request;
@@ -35,7 +37,7 @@ class UserController extends Controller
         $validated['restaurant_id'] = $request->user()->restaurant_id;
         $validated['password'] = \Illuminate\Support\Facades\Hash::make($validated['password']);
         if ($request->hasFile('image_file')) {
-            $validated['avatar'] = Storage::disk('public')->url($request->file('image_file')->store('users', 'public'));
+            $validated['avatar'] = $request->file('image_file')->store('users', 'public');
         }
         unset($validated['image_file']);
         $user = User::create($validated);
@@ -44,7 +46,7 @@ class UserController extends Controller
         if ($role) {
             $user->assignRole($role);
         }
-        return response()->json(['user' => $user->load('roles'), 'message' => 'تم إضافة المستخدم'], 201);
+        return response()->json(['user' => new UserResource($user->load('roles')), 'message' => 'تم إضافة المستخدم'], 201);
     }
 
     public function show(User $user)
@@ -52,7 +54,7 @@ class UserController extends Controller
         if ($user->restaurant_id !== auth()->user()->restaurant_id) {
             abort(403);
         }
-        return response()->json(['user' => $user->load('roles')]);
+        return response()->json(['user' => new UserResource($user->load('roles'))]);
     }
 
     public function update(Request $request, User $user)
@@ -73,17 +75,18 @@ class UserController extends Controller
             $validated['password'] = \Illuminate\Support\Facades\Hash::make($validated['password']);
         }
         if ($request->hasFile('image_file')) {
-            if ($user->avatar && str_contains($user->avatar, '/storage/')) {
-                Storage::disk('public')->delete(substr($user->avatar, strpos($user->avatar, '/storage/') + 9));
+            $oldAvatarPath = PublicMediaUrl::storagePath($user->avatar);
+            if ($oldAvatarPath) {
+                Storage::disk('public')->delete($oldAvatarPath);
             }
-            $validated['avatar'] = Storage::disk('public')->url($request->file('image_file')->store('users', 'public'));
+            $validated['avatar'] = $request->file('image_file')->store('users', 'public');
         }
         unset($validated['image_file']);
         $user->update($validated);
         if ($request->has('role')) {
             $user->syncRoles([$request->role]);
         }
-        return response()->json(['user' => $user->fresh()->load('roles'), 'message' => 'تم تحديث المستخدم']);
+        return response()->json(['user' => new UserResource($user->fresh()->load('roles')), 'message' => 'تم تحديث المستخدم']);
     }
 
     public function destroy(User $user)
