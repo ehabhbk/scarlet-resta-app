@@ -129,10 +129,6 @@ class Setting extends Model
         'type',
     ];
 
-    protected $casts = [
-        'value' => 'array',
-    ];
-
     public function restaurant(): BelongsTo
     {
         return $this->belongsTo(Restaurant::class);

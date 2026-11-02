@@ -100,6 +100,7 @@ class DatabaseSeeder extends Seeder
         // 4. Super Admin User
         $admin = \App\Models\User::create([
             'name' => 'المشرف العام',
+            'username' => 'admin',
             'email' => 'admin@scarletresta.com',
             'password' => 'admin123',
             'restaurant_id' => $restaurant->id,

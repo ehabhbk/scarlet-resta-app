@@ -13,7 +13,10 @@ class AuthController extends Controller
 {
     public function login(LoginRequest $request)
     {
-        $user = User::where('email', $request->email)->first();
+        $login = $request->username;
+        $user = User::where('username', $login)
+            ->orWhere('email', $login)
+            ->first();
 
         if (!$user || !Hash::check($request->password, $user->password)) {
             return response()->json(['message' => 'بيانات تسجيل الدخول غير صحيحة'], 401);
@@ -36,7 +39,7 @@ class AuthController extends Controller
     {
         $request->validate([
             'name' => 'required|string|max:255',
-            'email' => 'required|email|unique:users,email',
+            'username' => 'required|string|max:100|unique:users,username',
             'password' => 'required|string|min:6|confirmed',
             'restaurant_id' => 'required|exists:restaurants,id',
             'phone' => 'nullable|string|max:20',
@@ -44,7 +47,7 @@ class AuthController extends Controller
 
         $user = User::create([
             'name' => $request->name,
-            'email' => $request->email,
+            'username' => $request->username,
             'password' => $request->password,
             'restaurant_id' => $request->restaurant_id,
             'phone' => $request->phone,

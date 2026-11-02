@@ -200,29 +200,18 @@ class ShiftController extends Controller
         })->get();
 
         $total = $orders->sum(fn($o) => (float) $o->total_amount);
-        $byPayment = [
-            'cash' => 0,
-            'card' => 0,
-            'wallet' => 0,
-        ];
+        $byPayment = [];
         foreach ($orders as $order) {
-            $method = $order->payment_method ?? 'cash';
-            if (array_key_exists($method, $byPayment)) {
-                $byPayment[$method] += (float) $order->total_amount;
-            } elseif (isset($byPayment['cash'])) {
-                $byPayment['cash'] += (float) $order->total_amount;
-            }
+            $method = $order->payment_method ?: 'cash';
+            $byPayment[$method] = ($byPayment[$method] ?? 0) + (float) $order->total_amount;
         }
+        $byPayment = array_map(fn($v) => round($v, 4), $byPayment);
 
         return response()->json([
             'shift' => $shift->load('user'),
             'revenue' => [
                 'total' => round($total, 4),
-                'by_payment_method' => [
-                    'cash' => round($byPayment['cash'], 4),
-                    'card' => round($byPayment['card'], 4),
-                    'wallet' => round($byPayment['wallet'], 4),
-                ],
+                'by_payment_method' => $byPayment,
             ],
             'orders_count' => $orders->count(),
         ]);
@@ -242,12 +231,10 @@ class ShiftController extends Controller
             ->get();
 
         $total = $orders->sum(fn($o) => (float) $o->total_amount);
-        $byPayment = ['cash' => 0, 'card' => 0, 'wallet' => 0];
+        $byPayment = [];
         foreach ($orders as $order) {
-            $method = $order->payment_method ?? 'cash';
-            if (array_key_exists($method, $byPayment)) {
-                $byPayment[$method] += (float) $order->total_amount;
-            }
+            $method = $order->payment_method ?: 'cash';
+            $byPayment[$method] = ($byPayment[$method] ?? 0) + (float) $order->total_amount;
         }
 
         return response()->json([

@@ -94,19 +94,34 @@ class DashboardController extends Controller
         $restaurantId = $request->user()->restaurant_id;
         $limit = (int) $request->query('limit', 10);
 
-        $products = Product::where('restaurant_id', $restaurantId)
+        $rows = DB::table('order_items')
+            ->join('orders', 'orders.id', '=', 'order_items.order_id')
+            ->where('orders.restaurant_id', $restaurantId)
+            ->where('orders.status', '!=', 'cancelled')
+            ->select(
+                'order_items.product_id',
+                DB::raw('SUM(order_items.quantity) as sales_count'),
+                DB::raw('SUM(order_items.total_price) as revenue')
+            )
+            ->groupBy('order_items.product_id')
             ->orderByDesc('sales_count')
             ->limit($limit)
-            ->get()
-            ->map(function ($p) {
-                return [
-                    'id' => $p->id,
-                    'name' => $p->name,
-                    'sales_count' => (int) $p->sales_count,
-                    'sale_price' => (float) $p->sale_price,
-                    'image' => $p->image,
-                ];
-            });
+            ->get();
+
+        $products = $rows->map(function ($row) {
+            $product = Product::find($row->product_id);
+            if (!$product) {
+                return null;
+            }
+            return [
+                'id' => $product->id,
+                'name' => $product->name,
+                'sales_count' => (int) $row->sales_count,
+                'revenue' => (float) $row->revenue,
+                'sale_price' => (float) $product->sale_price,
+                'image' => $product->image,
+            ];
+        })->filter()->values();
 
         return response()->json(['products' => $products]);
     }
@@ -114,24 +129,27 @@ class DashboardController extends Controller
     public function staffPerformance(Request $request)
     {
         $restaurantId = $request->user()->restaurant_id;
-        $today = Carbon::today();
 
         $staff = User::where('restaurant_id', $restaurantId)
             ->where('is_active', true)
+            ->with('roles')
             ->get()
-            ->map(function ($u) use ($today, $restaurantId) {
+            ->map(function ($u) use ($restaurantId) {
                 $orders = Order::where('restaurant_id', $restaurantId)
                     ->where('cashier_id', $u->id)
-                    ->where('status', 'completed')
-                    ->whereDate('created_at', $today);
+                    ->where('status', '!=', 'cancelled');
                 return [
                     'id' => $u->id,
                     'name' => $u->name,
+                    'username' => $u->username,
                     'role' => $u->getRoleNames()->first(),
                     'orders_completed' => (int) $orders->count(),
-                    'revenue' => (float) $orders->where('payment_status', 'paid')->sum('total_amount'),
+                    'revenue' => (float) (clone $orders)->where('payment_status', 'paid')->sum('total_amount'),
                 ];
-            });
+            })
+            ->filter(fn ($row) => $row['orders_completed'] > 0)
+            ->sortByDesc('revenue')
+            ->values();
 
         return response()->json(['staff' => $staff]);
     }

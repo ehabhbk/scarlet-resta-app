@@ -25,6 +25,8 @@ Route::middleware('auth:sanctum,audit')->prefix('auth')->group(function () {
     Route::get('me', [\App\Http\Controllers\API\AuthController::class, 'me']);
     Route::get('restaurant', [\App\Http\Controllers\API\AuthController::class, 'restaurant']);
     Route::put('restaurant', [\App\Http\Controllers\API\RestaurantController::class, 'update']);
+    Route::post('restaurant/logo', [\App\Http\Controllers\API\RestaurantController::class, 'uploadLogo']);
+    Route::delete('restaurant/logo', [\App\Http\Controllers\API\RestaurantController::class, 'removeLogo']);
 });
 
 // Dashboard

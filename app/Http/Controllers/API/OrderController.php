@@ -55,7 +55,7 @@ class OrderController extends Controller
             'customer_phone' => 'nullable|string|max:50',
             'waiter_id' => 'nullable|exists:users,id',
             'type' => 'required|in:dine_in,takeaway,delivery',
-            'payment_method' => 'required|in:cash,card,wallet',
+            'payment_method' => 'required|string|max:50',
             'discount_amount' => 'nullable|numeric|min:0',
             'discount_percent' => 'nullable|numeric|min:0|max:100',
             'delivery_fee' => 'nullable|numeric|min:0',
@@ -224,6 +224,9 @@ class OrderController extends Controller
 
                 // Deduct inventory via recipe
                 $this->deductInventoryForProduct($product->id, $itemData['quantity'], $user->id, $order->id);
+
+                // Keep the product's sales counter in sync for dashboards/reports.
+                $product->increment('sales_count', $itemData['quantity']);
             }
 
             // Update table status
@@ -293,7 +296,7 @@ class OrderController extends Controller
             'notes' => 'nullable|string',
             'customer_notes' => 'nullable|string',
             'discount_amount' => 'nullable|numeric|min:0',
-            'payment_method' => 'sometimes|in:cash,card,wallet',
+            'payment_method' => 'sometimes|string|max:50',
         ]);
         $order->update($validated);
         return response()->json(['order' => $order->fresh(), 'message' => 'تم تحديث الطلب']);
@@ -328,6 +331,9 @@ class OrderController extends Controller
             // Restore inventory
             foreach ($order->items as $item) {
                 $this->restoreInventoryForProduct($item->product_id, $item->quantity, $user->id, $order->id);
+                Product::where('id', $item->product_id)
+                    ->where('sales_count', '>=', $item->quantity)
+                    ->decrement('sales_count', $item->quantity);
             }
 
             // Free table
@@ -395,7 +401,7 @@ class OrderController extends Controller
         }
         $validated = $request->validate([
             'amount' => 'required|numeric|min:0',
-            'method' => 'required|in:cash,card,wallet,bank_transfer,cheque',
+            'method' => 'required|string|max:50',
             'reference' => 'nullable|string',
             'transaction_id' => 'nullable|string',
         ]);

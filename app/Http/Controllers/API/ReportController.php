@@ -66,11 +66,36 @@ class ReportController extends Controller
     public function topProducts(Request $request)
     {
         $restaurantId = $request->user()->restaurant_id;
-        $products = Product::where('restaurant_id', $restaurantId)
+        $from = $request->query('from', Carbon::now()->startOfMonth()->format('Y-m-d'));
+        $to = $request->query('to', Carbon::now()->format('Y-m-d'));
+
+        $rows = DB::table('order_items')
+            ->join('orders', 'orders.id', '=', 'order_items.order_id')
+            ->where('orders.restaurant_id', $restaurantId)
+            ->where('orders.status', '!=', 'cancelled')
+            ->whereBetween('orders.created_at', [$from . ' 00:00:00', $to . ' 23:59:59'])
+            ->select(
+                'order_items.product_id',
+                DB::raw('SUM(order_items.quantity) as sales_count'),
+                DB::raw('SUM(order_items.total_price) as revenue')
+            )
+            ->groupBy('order_items.product_id')
             ->orderByDesc('sales_count')
-            ->limit(10)
-            ->get(['id', 'name', 'sales_count', 'sale_price']);
-        return response()->json(['products' => $products]);
+            ->limit(20)
+            ->get();
+
+        $products = $rows->map(function ($row) {
+            $product = Product::find($row->product_id);
+            return $product ? [
+                'id' => $product->id,
+                'name' => $product->name,
+                'sales_count' => (int) $row->sales_count,
+                'revenue' => (float) $row->revenue,
+                'sale_price' => (float) $product->sale_price,
+            ] : null;
+        })->filter()->values();
+
+        return response()->json(['products' => $products, 'from' => $from, 'to' => $to]);
     }
 
     public function inventory(Request $request)
@@ -117,13 +142,18 @@ class ReportController extends Controller
     {
         $restaurantId = $request->user()->restaurant_id;
         $staff = User::where('restaurant_id', $restaurantId)->where('is_active', true)->get()->map(function ($u) use ($restaurantId) {
+            $orders = Order::where('restaurant_id', $restaurantId)
+                ->where('cashier_id', $u->id)
+                ->where('status', '!=', 'cancelled');
             return [
                 'name' => $u->name,
+                'username' => $u->username,
                 'role' => $u->getRoleNames()->first(),
-                'orders' => Order::where('restaurant_id', $restaurantId)->where('cashier_id', $u->id)->where('status', 'completed')->count(),
+                'orders' => (int) $orders->count(),
+                'revenue' => (float) (clone $orders)->where('payment_status', 'paid')->sum('total_amount'),
             ];
-        });
-        return response()->json(['staff' => $staff]);
+        })->sortByDesc('revenue')->values();
+        return response()->json(['staff' => $staff, 'from' => $request->query('from'), 'to' => $request->query('to')]);
     }
 
     public function paymentMethods(Request $request)
