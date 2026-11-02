@@ -20,7 +20,7 @@ Route::prefix('auth')->group(function () {
 });
 
 // ---- Authenticated routes ----
-Route::middleware('auth:sanctum,audit')->prefix('auth')->group(function () {
+Route::middleware(['auth:sanctum', 'audit'])->prefix('auth')->group(function () {
     Route::post('logout', [\App\Http\Controllers\API\AuthController::class, 'logout']);
     Route::get('me', [\App\Http\Controllers\API\AuthController::class, 'me']);
     Route::get('restaurant', [\App\Http\Controllers\API\AuthController::class, 'restaurant']);
@@ -30,7 +30,7 @@ Route::middleware('auth:sanctum,audit')->prefix('auth')->group(function () {
 });
 
 // Dashboard
-Route::middleware('auth:sanctum,audit')->prefix('dashboard')->group(function () {
+Route::middleware(['auth:sanctum', 'audit'])->prefix('dashboard')->group(function () {
     Route::get('stats', [\App\Http\Controllers\API\DashboardController::class, 'stats']);
     Route::get('sales-chart', [\App\Http\Controllers\API\DashboardController::class, 'salesChart']);
     Route::get('top-products', [\App\Http\Controllers\API\DashboardController::class, 'topProducts']);
@@ -39,35 +39,35 @@ Route::middleware('auth:sanctum,audit')->prefix('dashboard')->group(function () 
 });
 
 // Restaurants
-Route::middleware('auth:sanctum,audit')->apiResource('restaurants', \App\Http\Controllers\API\RestaurantController::class);
+Route::middleware(['auth:sanctum', 'audit'])->apiResource('restaurants', \App\Http\Controllers\API\RestaurantController::class);
 
 // Categories
-Route::middleware('auth:sanctum,audit')->apiResource('categories', \App\Http\Controllers\API\CategoryController::class);
-Route::middleware('auth:sanctum,audit')->get('categories/tree', [\App\Http\Controllers\API\CategoryController::class, 'tree']);
+Route::middleware(['auth:sanctum', 'audit'])->apiResource('categories', \App\Http\Controllers\API\CategoryController::class);
+Route::middleware(['auth:sanctum', 'audit'])->get('categories/tree', [\App\Http\Controllers\API\CategoryController::class, 'tree']);
 
 // Products
-Route::middleware('auth:sanctum,audit')->apiResource('products', \App\Http\Controllers\API\ProductController::class);
-Route::middleware('auth:sanctum,audit')->get('products/available', [\App\Http\Controllers\API\ProductController::class, 'available']);
-Route::middleware('auth:sanctum,audit')->get('products/{product}/sizes', [\App\Http\Controllers\API\ProductController::class, 'sizes']);
-Route::middleware('auth:sanctum,audit')->get('products/{product}/modifiers', [\App\Http\Controllers\API\ProductController::class, 'modifiers']);
-Route::middleware('auth:sanctum,audit')->post('products/{product}/image', [\App\Http\Controllers\API\ProductController::class, 'uploadImage']);
+Route::middleware(['auth:sanctum', 'audit'])->apiResource('products', \App\Http\Controllers\API\ProductController::class);
+Route::middleware(['auth:sanctum', 'audit'])->get('products/available', [\App\Http\Controllers\API\ProductController::class, 'available']);
+Route::middleware(['auth:sanctum', 'audit'])->get('products/{product}/sizes', [\App\Http\Controllers\API\ProductController::class, 'sizes']);
+Route::middleware(['auth:sanctum', 'audit'])->get('products/{product}/modifiers', [\App\Http\Controllers\API\ProductController::class, 'modifiers']);
+Route::middleware(['auth:sanctum', 'audit'])->post('products/{product}/image', [\App\Http\Controllers\API\ProductController::class, 'uploadImage']);
 
 // Product sizes & modifiers (nested under products)
-Route::middleware('auth:sanctum,audit')->apiResource('products.sizes', \App\Http\Controllers\API\ProductSizeController::class)->only(['store', 'update', 'destroy']);
-Route::middleware('auth:sanctum,audit')->apiResource('products.modifiers', \App\Http\Controllers\API\ProductModifierController::class)->only(['store', 'update', 'destroy']);
+Route::middleware(['auth:sanctum', 'audit'])->apiResource('products.sizes', \App\Http\Controllers\API\ProductSizeController::class)->only(['store', 'update', 'destroy']);
+Route::middleware(['auth:sanctum', 'audit'])->apiResource('products.modifiers', \App\Http\Controllers\API\ProductModifierController::class)->only(['store', 'update', 'destroy']);
 
 // Tables & Areas
-Route::middleware('auth:sanctum,audit')->apiResource('areas', \App\Http\Controllers\API\AreaController::class);
-Route::middleware('auth:sanctum,audit')->apiResource('tables', \App\Http\Controllers\API\TableController::class);
+Route::middleware(['auth:sanctum', 'audit'])->apiResource('areas', \App\Http\Controllers\API\AreaController::class);
+Route::middleware(['auth:sanctum', 'audit'])->apiResource('tables', \App\Http\Controllers\API\TableController::class);
 
 // Orders
-Route::middleware('auth:sanctum,audit')->apiResource('orders', \App\Http\Controllers\API\OrderController::class);
-Route::middleware('auth:sanctum,audit')->post('orders/{order}/cancel', [\App\Http\Controllers\API\OrderController::class, 'cancel']);
-Route::middleware('auth:sanctum,audit')->post('orders/{order}/status', [\App\Http\Controllers\API\OrderController::class, 'updateStatus']);
-Route::middleware('auth:sanctum,audit')->post('orders/{order}/payment', [\App\Http\Controllers\API\OrderController::class, 'recordPayment']);
+Route::middleware(['auth:sanctum', 'audit'])->apiResource('orders', \App\Http\Controllers\API\OrderController::class);
+Route::middleware(['auth:sanctum', 'audit'])->post('orders/{order}/cancel', [\App\Http\Controllers\API\OrderController::class, 'cancel']);
+Route::middleware(['auth:sanctum', 'audit'])->post('orders/{order}/status', [\App\Http\Controllers\API\OrderController::class, 'updateStatus']);
+Route::middleware(['auth:sanctum', 'audit'])->post('orders/{order}/payment', [\App\Http\Controllers\API\OrderController::class, 'recordPayment']);
 
 // Kitchen
-Route::middleware('auth:sanctum,audit')->prefix('kitchen')->group(function () {
+Route::middleware(['auth:sanctum', 'audit'])->prefix('kitchen')->group(function () {
     Route::get('orders', [\App\Http\Controllers\API\KitchenController::class, 'index']);
     Route::get('stations', [\App\Http\Controllers\API\KitchenController::class, 'stations']);
     Route::post('stations', [\App\Http\Controllers\API\KitchenController::class, 'storeStation']);
@@ -80,33 +80,33 @@ Route::middleware('auth:sanctum,audit')->prefix('kitchen')->group(function () {
 });
 
 // Inventory
-Route::middleware('auth:sanctum,audit')->apiResource('inventory-units', \App\Http\Controllers\API\InventoryUnitController::class);
-Route::middleware('auth:sanctum,audit')->apiResource('suppliers', \App\Http\Controllers\API\SupplierController::class);
-Route::middleware('auth:sanctum,audit')->apiResource('inventory-items', \App\Http\Controllers\API\InventoryItemController::class);
-Route::middleware('auth:sanctum,audit')->apiResource('purchases', \App\Http\Controllers\API\PurchaseController::class);
-Route::middleware('auth:sanctum,audit')->apiResource('stock-movements', \App\Http\Controllers\API\StockMovementController::class);
-Route::middleware('auth:sanctum,audit')->get('inventory-items/low-stock', [\App\Http\Controllers\API\InventoryItemController::class, 'lowStock']);
+Route::middleware(['auth:sanctum', 'audit'])->apiResource('inventory-units', \App\Http\Controllers\API\InventoryUnitController::class);
+Route::middleware(['auth:sanctum', 'audit'])->apiResource('suppliers', \App\Http\Controllers\API\SupplierController::class);
+Route::middleware(['auth:sanctum', 'audit'])->apiResource('inventory-items', \App\Http\Controllers\API\InventoryItemController::class);
+Route::middleware(['auth:sanctum', 'audit'])->apiResource('purchases', \App\Http\Controllers\API\PurchaseController::class);
+Route::middleware(['auth:sanctum', 'audit'])->apiResource('stock-movements', \App\Http\Controllers\API\StockMovementController::class);
+Route::middleware(['auth:sanctum', 'audit'])->get('inventory-items/low-stock', [\App\Http\Controllers\API\InventoryItemController::class, 'lowStock']);
 
 // Recipes
-Route::middleware('auth:sanctum,audit')->apiResource('recipes', \App\Http\Controllers\API\RecipeController::class);
+Route::middleware(['auth:sanctum', 'audit'])->apiResource('recipes', \App\Http\Controllers\API\RecipeController::class);
 
 // Customers
-Route::middleware('auth:sanctum,audit')->apiResource('customers', \App\Http\Controllers\API\CustomerController::class);
+Route::middleware(['auth:sanctum', 'audit'])->apiResource('customers', \App\Http\Controllers\API\CustomerController::class);
 
 // Employees
-Route::middleware('auth:sanctum,audit')->apiResource('employees', \App\Http\Controllers\API\EmployeeController::class);
-Route::middleware('auth:sanctum,audit')->apiResource('attendances', \App\Http\Controllers\API\AttendanceController::class);
-Route::middleware('auth:sanctum,audit')->get('shifts/current', [\App\Http\Controllers\API\ShiftController::class, 'current']);
-Route::middleware('auth:sanctum,audit')->post('shifts/open', [\App\Http\Controllers\API\ShiftController::class, 'store']);
-Route::middleware('auth:sanctum,audit')->get('shifts/{shift}/revenue', [\App\Http\Controllers\API\ShiftController::class, 'revenue']);
-Route::middleware('auth:sanctum,audit')->apiResource('shifts', \App\Http\Controllers\API\ShiftController::class);
+Route::middleware(['auth:sanctum', 'audit'])->apiResource('employees', \App\Http\Controllers\API\EmployeeController::class);
+Route::middleware(['auth:sanctum', 'audit'])->apiResource('attendances', \App\Http\Controllers\API\AttendanceController::class);
+Route::middleware(['auth:sanctum', 'audit'])->get('shifts/current', [\App\Http\Controllers\API\ShiftController::class, 'current']);
+Route::middleware(['auth:sanctum', 'audit'])->post('shifts/open', [\App\Http\Controllers\API\ShiftController::class, 'store']);
+Route::middleware(['auth:sanctum', 'audit'])->get('shifts/{shift}/revenue', [\App\Http\Controllers\API\ShiftController::class, 'revenue']);
+Route::middleware(['auth:sanctum', 'audit'])->apiResource('shifts', \App\Http\Controllers\API\ShiftController::class);
 
 // Finance
-Route::middleware('auth:sanctum,audit')->apiResource('expenses', \App\Http\Controllers\API\ExpenseController::class);
-Route::middleware('auth:sanctum,audit')->apiResource('payments', \App\Http\Controllers\API\PaymentController::class);
+Route::middleware(['auth:sanctum', 'audit'])->apiResource('expenses', \App\Http\Controllers\API\ExpenseController::class);
+Route::middleware(['auth:sanctum', 'audit'])->apiResource('payments', \App\Http\Controllers\API\PaymentController::class);
 
 // Reports
-Route::middleware('auth:sanctum,audit')->prefix('reports')->group(function () {
+Route::middleware(['auth:sanctum', 'audit'])->prefix('reports')->group(function () {
     Route::get('sales', [\App\Http\Controllers\API\ReportController::class, 'sales']);
     Route::get('profit-loss', [\App\Http\Controllers\API\ReportController::class, 'profitLoss']);
     Route::get('top-products', [\App\Http\Controllers\API\ReportController::class, 'topProducts']);
@@ -121,16 +121,16 @@ Route::middleware('auth:sanctum,audit')->prefix('reports')->group(function () {
 });
 
 // Settings
-Route::middleware('auth:sanctum,audit')->apiResource('settings', \App\Http\Controllers\API\SettingController::class);
+Route::middleware(['auth:sanctum', 'audit'])->apiResource('settings', \App\Http\Controllers\API\SettingController::class);
 
 // Notifications
-Route::middleware('auth:sanctum,audit')->prefix('notifications')->group(function () {
+Route::middleware(['auth:sanctum', 'audit'])->prefix('notifications')->group(function () {
     Route::get('/', [\App\Http\Controllers\API\NotificationController::class, 'index']);
     Route::post('{notification}/read', [\App\Http\Controllers\API\NotificationController::class, 'markRead']);
 });
 
 // Users & Roles & Permissions (admin only)
-Route::middleware(['auth:sanctum,audit', 'role:Super Admin|Admin'])->prefix('admin')->group(function () {
+Route::middleware(['auth:sanctum', 'audit', 'role:Super Admin|Admin'])->prefix('admin')->group(function () {
     Route::apiResource('users', \App\Http\Controllers\API\UserController::class);
     Route::apiResource('roles', \App\Http\Controllers\API\RoleController::class);
     Route::apiResource('permissions', \App\Http\Controllers\API\PermissionController::class);
