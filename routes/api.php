@@ -151,3 +151,13 @@ Route::middleware(['auth:sanctum', 'audit', 'role:Super Admin|Admin'])->prefix('
     Route::apiResource('roles', \App\Http\Controllers\API\RoleController::class);
     Route::apiResource('permissions', \App\Http\Controllers\API\PermissionController::class);
 });
+
+// Accounting
+Route::middleware(['auth:sanctum', 'audit'])->apiResource('accounts', \App\Http\Controllers\API\AccountController::class);
+Route::middleware(['auth:sanctum', 'audit'])->apiResource('journal-entries', \App\Http\Controllers\API\JournalEntryController::class);
+Route::middleware(['auth:sanctum', 'audit'])->prefix('accounting')->group(function () {
+    Route::get('chart-of-accounts', [\App\Http\Controllers\API\AccountingController::class, 'chartOfAccounts']);
+    Route::get('ledger', [\App\Http\Controllers\API\AccountingController::class, 'ledger']);
+    Route::get('income-statement', [\App\Http\Controllers\API\AccountingController::class, 'incomeStatement']);
+    Route::get('balance-sheet', [\App\Http\Controllers\API\AccountingController::class, 'balanceSheet']);
+});
