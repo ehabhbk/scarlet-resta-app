@@ -200,10 +200,20 @@ class ShiftController extends Controller
         })->get();
 
         $total = $orders->sum(fn($o) => (float) $o->total_amount);
+        $orderIds = $orders->pluck('id');
+        $payments = \App\Models\Payment::where('paymentable_type', \App\Models\Order::class)
+            ->whereIn('paymentable_id', $orderIds)
+            ->get();
         $byPayment = [];
-        foreach ($orders as $order) {
-            $method = $order->payment_method ?: 'cash';
-            $byPayment[$method] = ($byPayment[$method] ?? 0) + (float) $order->total_amount;
+        foreach ($payments as $payment) {
+            $method = $payment->method ?: 'cash';
+            $byPayment[$method] = ($byPayment[$method] ?? 0) + (float) $payment->amount;
+        }
+        if (empty($byPayment)) {
+            foreach ($orders as $order) {
+                $method = $order->payment_method ?: 'cash';
+                $byPayment[$method] = ($byPayment[$method] ?? 0) + (float) $order->total_amount;
+            }
         }
         $byPayment = array_map(fn($v) => round($v, 4), $byPayment);
 
@@ -231,10 +241,20 @@ class ShiftController extends Controller
             ->get();
 
         $total = $orders->sum(fn($o) => (float) $o->total_amount);
+        $orderIds = $orders->pluck('id');
+        $payments = \App\Models\Payment::where('paymentable_type', \App\Models\Order::class)
+            ->whereIn('paymentable_id', $orderIds)
+            ->get();
         $byPayment = [];
-        foreach ($orders as $order) {
-            $method = $order->payment_method ?: 'cash';
-            $byPayment[$method] = ($byPayment[$method] ?? 0) + (float) $order->total_amount;
+        foreach ($payments as $payment) {
+            $method = $payment->method ?: 'cash';
+            $byPayment[$method] = ($byPayment[$method] ?? 0) + (float) $payment->amount;
+        }
+        if (empty($byPayment)) {
+            foreach ($orders as $order) {
+                $method = $order->payment_method ?: 'cash';
+                $byPayment[$method] = ($byPayment[$method] ?? 0) + (float) $order->total_amount;
+            }
         }
 
         return response()->json([
@@ -306,6 +326,7 @@ class ShiftController extends Controller
             'notes' => 'sometimes|string',
             'end_time' => 'sometimes|date_format:H:i',
         ]);
+        $journalCreated = false;
         if ($request->has('status') && $request->status === 'closed') {
             $cashRevenue = (float) Order::where('shift_id', $shift->id)
                 ->where('payment_method', 'cash')
@@ -322,6 +343,83 @@ class ShiftController extends Controller
             if (empty($validated['end_time'])) {
                 $validated['end_time'] = now()->format('H:i:s');
             }
+
+            $journalCreated = false;
+            // Auto-create journal entry for shift revenue, linked to accounts
+            try {
+                $orders = \App\Models\Order::where('shift_id', $shift->id)
+                    ->where(function ($q) {
+                        $q->where('payment_status', 'paid')->orWhere('status', 'completed');
+                    })->get();
+                $orderIds = $orders->pluck('id');
+                $payments = \App\Models\Payment::where('paymentable_type', \App\Models\Order::class)
+                    ->whereIn('paymentable_id', $orderIds)->get();
+                $byPayment = [];
+                foreach ($payments as $p) {
+                    $byPayment[$p->method ?: 'cash'] = ($byPayment[$p->method ?: 'cash'] ?? 0) + (float) $p->amount;
+                }
+                if (empty($byPayment)) {
+                    foreach ($orders as $o) {
+                        $byPayment[$o->payment_method ?: 'cash'] = ($byPayment[$o->payment_method ?: 'cash'] ?? 0) + (float) $o->total_amount;
+                    }
+                }
+
+                $restaurantId = $shift->restaurant_id;
+                $revenueAccount = \App\Models\Account::firstOrCreate(
+                    ['restaurant_id' => $restaurantId, 'code' => '4000'],
+                    ['name' => 'إيرادات المبيعات', 'type' => 'revenue', 'opening_balance' => 0, 'is_active' => true]
+                );
+
+                $paymentSettings = \App\Models\Setting::where('restaurant_id', $restaurantId)
+                    ->where('group', 'pos')->where('key', 'payment_methods')->value('value');
+                $methodAccounts = [];
+                if ($paymentSettings) {
+                    $decoded = json_decode($paymentSettings, true);
+                    if (is_array($decoded)) {
+                        foreach ($decoded as $pm) {
+                            if (!empty($pm['account_id'])) {
+                                $methodAccounts[$pm['value'] ?? $pm['method'] ?? ''] = (int) $pm['account_id'];
+                            }
+                        }
+                    }
+                }
+
+                $lines = [];
+                $totalRevenue = 0;
+                foreach ($byPayment as $method => $amount) {
+                    if ((float) $amount <= 0) continue;
+                    $accountId = $methodAccounts[$method] ?? null;
+                    if (!$accountId) {
+                        $defaultCode = $method === 'cash' ? '1000' : '1010';
+                        $defaultName = $method === 'cash' ? 'الخزنة الرئيسية' : 'البنك';
+                        $defaultAccount = \App\Models\Account::firstOrCreate(
+                            ['restaurant_id' => $restaurantId, 'code' => $defaultCode],
+                            ['name' => $defaultName, 'type' => 'asset', 'opening_balance' => 0, 'is_active' => true]
+                        );
+                        $accountId = $defaultAccount->id;
+                    }
+                    $lines[] = ['account_id' => $accountId, 'debit' => (float) $amount, 'credit' => 0, 'description' => 'إيراد وردية - ' . $method];
+                    $totalRevenue += (float) $amount;
+                }
+                if ($totalRevenue > 0) {
+                    $lines[] = ['account_id' => $revenueAccount->id, 'debit' => 0, 'credit' => $totalRevenue, 'description' => 'إيراد وردية #' . $shift->id];
+                    $lastNumber = \App\Models\JournalEntry::where('restaurant_id', $restaurantId)->max('id') ?? 0;
+                    $entry = \App\Models\JournalEntry::create([
+                        'restaurant_id' => $restaurantId,
+                        'entry_number' => 'SH-' . str_pad((string) ($lastNumber + 1), 6, '0', STR_PAD_LEFT),
+                        'entry_date' => now()->toDateString(),
+                        'reference' => 'SHIFT-' . $shift->id,
+                        'description' => 'قيد إغلاق الوردية #' . $shift->id,
+                        'created_by' => $request->user()->id,
+                    ]);
+                    foreach ($lines as $line) {
+                        $entry->lines()->create($line);
+                    }
+                    $journalCreated = true;
+                }
+            } catch (\Throwable $e) {
+                // Do not block shift closing on accounting errors
+            }
         } elseif ($request->has('actual_cash')) {
             $expected = (float) ($shift->expected_cash ?? $shift->opening_cash ?? 0);
             $validated['difference'] = (float) $validated['actual_cash'] - $expected;
@@ -330,7 +428,7 @@ class ShiftController extends Controller
             $validated['end_time'] = $validated['end_time'] . ':00';
         }
         $shift->update($validated);
-        return response()->json(['shift' => $shift->fresh()->load('user'), 'message' => 'تم تحديث الوردية']);
+        return response()->json(['shift' => $shift->fresh()->load('user'), 'message' => $journalCreated ? 'تم إغلاق الوردية وإنشاء قيد الوردية بنجاح' : 'تم إغلاق الوردية']);
     }
 
     public function destroy(Shift $shift)

@@ -15,6 +15,7 @@ class Expense extends Model
         'restaurant_id',
         'user_id',
         'category',
+        'account_id',
         'amount',
         'expense_date',
         'description',
@@ -44,6 +45,11 @@ class Expense extends Model
     public function approvedBy(): BelongsTo
     {
         return $this->belongsTo(User::class, 'approved_by');
+    }
+
+    public function account(): BelongsTo
+    {
+        return $this->belongsTo(Account::class);
     }
 
     public function payments()

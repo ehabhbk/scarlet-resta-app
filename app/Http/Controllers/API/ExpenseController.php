@@ -32,6 +32,7 @@ class ExpenseController extends Controller
     {
         $validated = $request->validate([
             'category' => 'required|string|max:100',
+            'account_id' => 'nullable|exists:accounts,id',
             'amount' => 'required|numeric|min:0',
             'expense_date' => 'required|date',
             'description' => 'nullable|string',
@@ -43,7 +44,32 @@ class ExpenseController extends Controller
         $validated['user_id'] = $request->user()->id;
         $validated['is_approved'] = $request->boolean('is_approved', false);
         $expense = Expense::create($validated);
-        return response()->json(['expense' => $expense->load('user'), 'message' => 'تم إضافة المصروف'], 201);
+                if (!empty($validated['account_id']) && (float) $validated['amount'] > 0) {
+            try {
+                $restaurantId = $validated['restaurant_id'];
+                $expenseAccount = \App\Models\Account::where('id', $validated['account_id'])->where('restaurant_id', $restaurantId)->first();
+                $cashCode = ($validated['payment_method'] ?? 'cash') === 'cash' ? '1000' : '1010';
+                $cashAccount = \App\Models\Account::firstOrCreate(
+                    ['restaurant_id' => $restaurantId, 'code' => $cashCode],
+                    ['name' => $cashCode === '1000' ? 'الخزنة الرئيسية' : 'البنك', 'type' => 'asset', 'opening_balance' => 0, 'is_active' => true]
+                );
+                if ($expenseAccount) {
+                    $lastNumber = \App\Models\JournalEntry::where('restaurant_id', $restaurantId)->max('id') ?? 0;
+                    $entry = \App\Models\JournalEntry::create([
+                        'restaurant_id' => $restaurantId,
+                        'entry_number' => 'EX-' . str_pad((string) ($lastNumber + 1), 6, '0', STR_PAD_LEFT),
+                        'entry_date' => $validated['expense_date'],
+                        'reference' => 'EXPENSE-' . $expense->id,
+                        'description' => 'مصروف: ' . $validated['category'],
+                        'created_by' => $request->user()->id,
+                    ]);
+                    $entry->lines()->create(['account_id' => $expenseAccount->id, 'debit' => (float) $validated['amount'], 'credit' => 0, 'description' => $validated['description'] ?? null]);
+                    $entry->lines()->create(['account_id' => $cashAccount->id, 'debit' => 0, 'credit' => (float) $validated['amount'], 'description' => $validated['description'] ?? null]);
+                }
+            } catch (\Throwable $e) {
+            }
+        }
+        return response()->json(['expense' => $expense->load('user', 'account'), 'message' => 'تم إنشاء المصروف'], 201);
     }
 
     public function show(Expense $expense)
@@ -96,7 +122,7 @@ class PaymentController extends Controller
             'paymentable_type' => 'required|string|max:100',
             'paymentable_id' => 'required|integer',
             'amount' => 'required|numeric|min:0',
-            'method' => 'required|in:cash,card,wallet,bank_transfer,cheque',
+            'method' => 'required|string|max:50',
             'reference' => 'nullable|string',
             'transaction_id' => 'nullable|string',
             'notes' => 'nullable|string',
