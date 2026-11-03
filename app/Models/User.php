@@ -13,7 +13,7 @@ use Spatie\Permission\Traits\HasRoles;
 class User extends Authenticatable
 {
     /** @use HasFactory<UserFactory> */
-    use HasFactory, Notifiable, HasApiTokens, HasRoles;
+    use HasApiTokens, HasFactory, HasRoles, Notifiable;
 
     public function getGuardName(): string
     {
@@ -39,6 +39,8 @@ class User extends Authenticatable
         'phone',
         'avatar',
         'is_active',
+        'vault_account_id',
+        'pay_account_id',
     ];
 
     /**
@@ -78,6 +80,16 @@ class User extends Authenticatable
     public function shifts()
     {
         return $this->hasMany(Shift::class);
+    }
+
+    public function vaultAccount()
+    {
+        return $this->belongsTo(Account::class, 'vault_account_id');
+    }
+
+    public function payAccount()
+    {
+        return $this->belongsTo(Account::class, 'pay_account_id');
     }
 
     public function scopeActive($query)

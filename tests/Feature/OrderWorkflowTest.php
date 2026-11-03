@@ -2,16 +2,20 @@
 
 namespace Tests\Feature;
 
+use App\Models\Account;
+use App\Models\KitchenStation;
 use App\Models\Order;
 use App\Models\OrderItem;
 use App\Models\OrderKitchenStation;
-use App\Models\KitchenStation;
 use App\Models\Product;
 use App\Models\Restaurant;
+use App\Models\Setting;
 use App\Models\Shift;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Str;
+use Spatie\Permission\Models\Permission;
+use Spatie\Permission\Models\Role;
 use Tests\TestCase;
 
 class OrderWorkflowTest extends TestCase
@@ -19,6 +23,7 @@ class OrderWorkflowTest extends TestCase
     use RefreshDatabase;
 
     private Restaurant $restaurant;
+
     private User $user;
 
     protected function setUp(): void
@@ -34,7 +39,40 @@ class OrderWorkflowTest extends TestCase
             'restaurant_id' => $this->restaurant->id,
             'username' => Str::uuid()->toString(),
         ]);
-        $this->actingAs($this->user);
+        $permissionNames = [
+            'view_orders',
+            'view_all_orders',
+            'create_orders',
+            'edit_orders',
+            'delete_orders',
+            'cancel_orders',
+            'refund_orders',
+            'update_kitchen_order',
+        ];
+        $permissions = collect($permissionNames)->map(fn (string $name) => Permission::firstOrCreate([
+            'name' => $name,
+            'guard_name' => 'sanctum',
+        ]));
+        $role = Role::create(['name' => 'Order Workflow Test', 'guard_name' => 'sanctum']);
+        $role->syncPermissions($permissions);
+        $this->user->assignRole($role);
+        $cashAccount = Account::create([
+            'restaurant_id' => $this->restaurant->id,
+            'code' => '1001',
+            'name' => 'حساب النقد',
+            'type' => 'asset',
+            'is_active' => true,
+        ]);
+        Setting::create([
+            'restaurant_id' => $this->restaurant->id,
+            'group' => 'pos',
+            'key' => 'payment_methods',
+            'value' => json_encode([
+                ['value' => 'cash', 'label' => 'نقدي', 'account_id' => $cashAccount->id],
+            ]),
+            'type' => 'json',
+        ]);
+        $this->actingAs($this->user, 'sanctum');
     }
 
     public function test_orders_can_be_listed_with_items_for_a_shift(): void
@@ -46,7 +84,7 @@ class OrderWorkflowTest extends TestCase
         $otherProduct = $this->createProduct('Coffee', 7);
         $this->createOrder($otherShift, $otherProduct, 7);
 
-        $this->getJson('/api/orders?shift_id=' . $shift->id)
+        $this->getJson('/api/orders?shift_id='.$shift->id)
             ->assertOk()
             ->assertJsonPath('data.0.id', $order->id)
             ->assertJsonPath('data.0.shift_id', $shift->id)
@@ -60,7 +98,7 @@ class OrderWorkflowTest extends TestCase
         $newProduct = $this->createProduct('Replacement', 8);
         $order = $this->createOrder($shift, $oldProduct, 10, 10);
 
-        $this->putJson('/api/orders/' . $order->id, [
+        $this->putJson('/api/orders/'.$order->id, [
             'items' => [
                 ['product_id' => $newProduct->id, 'quantity' => 1],
             ],
@@ -92,7 +130,7 @@ class OrderWorkflowTest extends TestCase
         $newProduct = $this->createProduct('Replacement', 15);
         $order = $this->createOrder($shift, $oldProduct, 10, 10);
 
-        $this->putJson('/api/orders/' . $order->id, [
+        $this->putJson('/api/orders/'.$order->id, [
             'items' => [
                 ['product_id' => $newProduct->id, 'quantity' => 1],
             ],
@@ -117,7 +155,7 @@ class OrderWorkflowTest extends TestCase
         $product = $this->createProduct('Tea', 10);
         $order = $this->createOrder($shift, $product, 10, 10);
 
-        $this->postJson('/api/orders/' . $order->id . '/refund', ['reason' => 'Customer request'])
+        $this->postJson('/api/orders/'.$order->id.'/refund', ['reason' => 'Customer request'])
             ->assertOk()
             ->assertJsonPath('order.payment_status', 'refunded')
             ->assertJsonPath('order.amount_paid', '0.0000');
@@ -127,7 +165,7 @@ class OrderWorkflowTest extends TestCase
             'paymentable_id' => $order->id,
             'amount' => -10,
         ]);
-        $this->postJson('/api/orders/' . $order->id . '/refund')
+        $this->postJson('/api/orders/'.$order->id.'/refund')
             ->assertStatus(400);
     }
 
@@ -137,8 +175,8 @@ class OrderWorkflowTest extends TestCase
         $product = $this->createProduct('Tea', 10);
         $order = $this->createOrder($shift, $product, 10, 10);
 
-        $this->postJson('/api/orders/' . $order->id . '/cancel')->assertOk();
-        $this->postJson('/api/orders/' . $order->id . '/refund')
+        $this->postJson('/api/orders/'.$order->id.'/cancel')->assertOk();
+        $this->postJson('/api/orders/'.$order->id.'/refund')
             ->assertOk()
             ->assertJsonPath('order.payment_status', 'refunded');
     }
@@ -149,7 +187,7 @@ class OrderWorkflowTest extends TestCase
         $product = $this->createProduct('Tea', 10);
         $order = $this->createOrder($shift, $product, 10);
 
-        $this->deleteJson('/api/orders/' . $order->id)
+        $this->deleteJson('/api/orders/'.$order->id)
             ->assertOk();
 
         $this->assertSoftDeleted('orders', ['id' => $order->id]);
@@ -203,7 +241,7 @@ class OrderWorkflowTest extends TestCase
             'station_id' => $station->id,
         ]);
 
-        $this->postJson('/api/kitchen/order-items/' . $item->id . '/status', [
+        $this->postJson('/api/kitchen/order-items/'.$item->id.'/status', [
             'status' => 'ready',
             'station_id' => $station->id,
         ])->assertOk()
@@ -231,7 +269,7 @@ class OrderWorkflowTest extends TestCase
         return Product::create([
             'restaurant_id' => $this->restaurant->id,
             'name' => $name,
-            'slug' => Str::slug($name) . '-' . Str::uuid(),
+            'slug' => Str::slug($name).'-'.Str::uuid(),
             'sale_price' => $price,
             'cost_price' => $price / 2,
             'image' => $image,
@@ -244,7 +282,7 @@ class OrderWorkflowTest extends TestCase
             'restaurant_id' => $this->restaurant->id,
             'shift_id' => $shift->id,
             'cashier_id' => $this->user->id,
-            'order_number' => 'ORD-' . Str::uuid(),
+            'order_number' => 'ORD-'.Str::uuid(),
             'type' => 'takeaway',
             'status' => 'pending',
             'payment_status' => $paid >= $total ? 'paid' : ($paid > 0 ? 'partial' : 'unpaid'),

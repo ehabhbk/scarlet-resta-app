@@ -3,35 +3,41 @@
 namespace App\Http\Controllers\API;
 
 use App\Http\Controllers\Controller;
+use App\Http\Resources\OrderResource;
+use App\Models\Customer;
+use App\Models\InventoryItem;
+use App\Models\ModifierOption;
 use App\Models\Order;
 use App\Models\OrderItem;
 use App\Models\OrderItemModifier;
 use App\Models\OrderStatusHistory;
-use App\Models\Table;
-use App\Models\Product;
-use App\Models\Recipe;
-use App\Models\RecipeIngredient;
-use App\Models\InventoryItem;
-use App\Models\StockMovement;
 use App\Models\Payment;
-use App\Models\Customer;
-use App\Http\Resources\OrderResource;
+use App\Models\Product;
+use App\Models\ProductModifier;
+use App\Models\Recipe;
+use App\Models\Shift;
+use App\Models\StockMovement;
+use App\Models\Table;
+use App\Services\JournalPostingService;
+use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Str;
-use Carbon\Carbon;
 
 class OrderController extends Controller
 {
     public function index(Request $request)
     {
         $restaurantId = $request->user()->restaurant_id;
+        abort_unless($request->user()->hasPermissionTo('view_orders', 'sanctum'), 403);
         $query = Order::where('restaurant_id', $restaurantId)
             ->with([
                 'table', 'customer', 'cashier', 'waiter', 'payments',
                 'items.product', 'items.size', 'items.modifiers.modifier', 'items.modifiers.modifierOption',
             ]);
 
+        if (! $request->user()->hasPermissionTo('view_all_orders', 'sanctum')) {
+            $query->where('cashier_id', $request->user()->id);
+        }
         if ($request->has('status')) {
             $query->where('status', $request->status);
         }
@@ -50,11 +56,13 @@ class OrderController extends Controller
 
         $perPage = min(max($request->integer('per_page', 15), 1), 100);
         $orders = $query->orderByDesc('created_at')->paginate($perPage);
+
         return OrderResource::collection($orders);
     }
 
     public function store(Request $request)
     {
+        abort_unless($request->user()->hasPermissionTo('create_orders', 'sanctum'), 403);
         $validated = $request->validate([
             'table_id' => 'nullable|exists:tables,id',
             'customer_id' => 'nullable|exists:customers,id',
@@ -83,6 +91,8 @@ class OrderController extends Controller
 
         $user = $request->user();
         $restaurantId = $user->restaurant_id;
+        app(JournalPostingService::class)
+            ->assertConfiguredPaymentMethod($restaurantId, $validated['payment_method']);
 
         return DB::transaction(function () use ($validated, $user, $restaurantId) {
             $orderNumber = $this->nextOrderNumber();
@@ -117,15 +127,15 @@ class OrderController extends Controller
 
             // Resolve / create the walk-in customer from the name entered at the POS.
             $customerId = $validated['customer_id'] ?? null;
-            if (!$customerId && !empty($validated['customer_name'])) {
+            if (! $customerId && ! empty($validated['customer_name'])) {
                 $customerQuery = Customer::where('restaurant_id', $restaurantId);
-                if (!empty($validated['customer_phone'])) {
+                if (! empty($validated['customer_phone'])) {
                     $customerQuery->where('phone', $validated['customer_phone']);
                 } else {
                     $customerQuery->where('name', $validated['customer_name']);
                 }
                 $customer = $customerQuery->first();
-                if (!$customer) {
+                if (! $customer) {
                     $customer = Customer::create([
                         'restaurant_id' => $restaurantId,
                         'name' => $validated['customer_name'],
@@ -138,7 +148,7 @@ class OrderController extends Controller
             }
 
             // Attach the sale to the cashier's currently open shift (if any).
-            $currentShift = \App\Models\Shift::where('restaurant_id', $restaurantId)
+            $currentShift = Shift::where('restaurant_id', $restaurantId)
                 ->where('user_id', $user->id)
                 ->where('status', 'open')
                 ->latest('id')
@@ -195,9 +205,9 @@ class OrderController extends Controller
                 ]);
 
                 // Modifiers
-                if (!empty($itemData['modifier_options'])) {
+                if (! empty($itemData['modifier_options'])) {
                     foreach ($itemData['modifier_options'] as $modOpt) {
-                        $option = \App\Models\ModifierOption::findOrFail($modOpt['modifier_option_id']);
+                        $option = ModifierOption::findOrFail($modOpt['modifier_option_id']);
                         OrderItemModifier::create([
                             'order_item_id' => $orderItem->id,
                             'modifier_id' => $modOpt['modifier_id'],
@@ -215,7 +225,7 @@ class OrderController extends Controller
             }
 
             // Update table status
-            if (!empty($validated['table_id'])) {
+            if (! empty($validated['table_id'])) {
                 $table = Table::find($validated['table_id']);
                 if ($table && $table->restaurant_id === $restaurantId) {
                     $table->update(['status' => 'occupied']);
@@ -265,18 +275,15 @@ class OrderController extends Controller
 
     public function show(Order $order)
     {
-        if ($order->restaurant_id !== auth()->user()->restaurant_id) {
-            abort(403);
-        }
+        $this->authorizeOrder($order, request(), 'view_orders');
         $order->load(['items.product.sizes', 'items.modifiers.modifier', 'items.modifiers.modifierOption', 'table', 'customer', 'cashier', 'waiter', 'statusHistories.changedBy', 'payments']);
+
         return new OrderResource($order);
     }
 
     public function update(Request $request, Order $order)
     {
-        if ($order->restaurant_id !== auth()->user()->restaurant_id) {
-            abort(403);
-        }
+        $this->authorizeOrder($order, $request, 'edit_orders');
         if (in_array($order->status, ['cancelled'], true) || $order->payment_status === 'refunded') {
             return response()->json(['message' => 'لا يمكن تعديل طلب ملغي أو مسترد'], 400);
         }
@@ -299,6 +306,15 @@ class OrderController extends Controller
 
         return DB::transaction(function () use ($validated, $request, $order) {
             $updates = collect($validated)->except(['items', 'amount_received'])->all();
+            if (array_key_exists('payment_method', $validated)) {
+                app(JournalPostingService::class)
+                    ->assertConfiguredPaymentMethod($order->restaurant_id, $validated['payment_method']);
+                Payment::where('paymentable_type', Order::class)
+                    ->where('paymentable_id', $order->id)
+                    ->where('amount', '>', 0)
+                    ->update(['method' => $validated['payment_method'], 'updated_at' => now()]);
+                $updates['payment_method'] = $validated['payment_method'];
+            }
             if (isset($validated['items'])) {
                 $user = $request->user();
                 $restaurant = $user->restaurant;
@@ -340,7 +356,7 @@ class OrderController extends Controller
                     ]);
 
                     foreach ($itemData['modifier_options'] ?? [] as $modifierOption) {
-                        $option = \App\Models\ModifierOption::findOrFail($modifierOption['modifier_option_id']);
+                        $option = ModifierOption::findOrFail($modifierOption['modifier_option_id']);
                         OrderItemModifier::create([
                             'order_item_id' => $item->id,
                             'modifier_id' => $modifierOption['modifier_id'],
@@ -407,6 +423,7 @@ class OrderController extends Controller
             }
 
             $order->update($updates);
+
             return response()->json([
                 'order' => new OrderResource($order->fresh()->load([
                     'items.product', 'items.size', 'items.modifiers.modifier',
@@ -419,9 +436,7 @@ class OrderController extends Controller
 
     public function destroy(Order $order)
     {
-        if ($order->restaurant_id !== auth()->user()->restaurant_id) {
-            abort(403);
-        }
+        $this->authorizeOrder($order, request(), 'delete_orders');
         if ((float) $order->amount_paid > 0) {
             return response()->json(['message' => 'استرداد قيمة الطلب قبل حذفه'], 400);
         }
@@ -437,16 +452,15 @@ class OrderController extends Controller
             Table::whereKey($order->table_id)->update(['status' => 'available']);
         }
         $order->delete();
+
         return response()->json(['message' => 'تم حذف الطلب']);
     }
 
     public function refund(Request $request, Order $order)
     {
-        if ($order->restaurant_id !== auth()->user()->restaurant_id) {
-            abort(403);
-        }
+        $this->authorizeOrder($order, $request, 'refund_orders');
         $refundableAmount = max(0, (float) $order->amount_paid - (float) $order->change_due);
-        if (!in_array($order->payment_status, ['paid', 'partial'], true) || $refundableAmount <= 0) {
+        if (! in_array($order->payment_status, ['paid', 'partial'], true) || $refundableAmount <= 0) {
             return response()->json(['message' => 'لا يمكن استرجاع دفع غير مدفوع'], 400);
         }
         $user = $request->user();
@@ -462,6 +476,7 @@ class OrderController extends Controller
         }
         $refundAmount = min($requestedAmount, $refundableAmount);
         $isFullRefund = $refundAmount >= $refundableAmount - 0.0001;
+
         return DB::transaction(function () use ($order, $user, $validated, $refundAmount, $isFullRefund) {
             if ($order->payment_status === 'refunded') {
                 return response()->json(['message' => 'تم استرداد هذا الطلب مسبقاً'], 400);
@@ -492,7 +507,7 @@ class OrderController extends Controller
                     'old_status' => $oldStatus,
                     'new_status' => 'cancelled',
                     'changed_by' => $user->id,
-                    'notes' => 'استرجاع دفع: ' . ($validated['reason'] ?? 'بدون سبب'),
+                    'notes' => 'استرجاع دفع: '.($validated['reason'] ?? 'بدون سبب'),
                 ]);
             } else {
                 $remainingPaid = max(0, (float) $order->amount_paid - $refundAmount);
@@ -512,8 +527,9 @@ class OrderController extends Controller
                 'method' => $order->payment_method ?: 'cash',
                 'paid_at' => now(),
                 'user_id' => $user->id,
-                'notes' => ($isFullRefund ? 'استرداد كامل للطلب: ' : 'استرداد جزئي للطلب: ') . ($validated['reason'] ?? ''),
+                'notes' => ($isFullRefund ? 'استرداد كامل للطلب: ' : 'استرداد جزئي للطلب: ').($validated['reason'] ?? ''),
             ]);
+
             return response()->json([
                 'order' => $order->fresh(),
                 'message' => $isFullRefund
@@ -525,10 +541,8 @@ class OrderController extends Controller
 
     public function cancel(Request $request, Order $order)
     {
-        if ($order->restaurant_id !== auth()->user()->restaurant_id) {
-            abort(403);
-        }
-        if (!in_array($order->status, ['pending', 'confirmed', 'preparing'])) {
+        $this->authorizeOrder($order, $request, 'cancel_orders');
+        if (! in_array($order->status, ['pending', 'confirmed', 'preparing'])) {
             return response()->json(['message' => 'لا يمكن إلغاء الطلب في حالته الحالية'], 400);
         }
         $user = $request->user();
@@ -562,7 +576,7 @@ class OrderController extends Controller
                 'old_status' => $order->getOriginal('status'),
                 'new_status' => 'cancelled',
                 'changed_by' => $user->id,
-                'notes' => 'إلغاء الطلب: ' . ($validated['reason'] ?? 'بدون سبب'),
+                'notes' => 'إلغاء الطلب: '.($validated['reason'] ?? 'بدون سبب'),
             ]);
 
             return response()->json(['order' => $order->fresh(), 'message' => 'تم إلغاء الطلب']);
@@ -571,13 +585,16 @@ class OrderController extends Controller
 
     public function updateStatus(Request $request, Order $order)
     {
-        if ($order->restaurant_id !== auth()->user()->restaurant_id) {
-            abort(403);
-        }
         $validated = $request->validate([
-            'status' => 'required|in:pending,confirmed,preparing,ready,served,completed,cancelled',
+            'status' => 'required|in:pending,confirmed,preparing,ready,served,completed',
             'notes' => 'nullable|string',
         ]);
+
+        if ($validated['status'] === 'served' && $request->user()->hasPermissionTo('update_kitchen_order', 'sanctum')) {
+            abort_unless($order->restaurant_id === $request->user()->restaurant_id, 404);
+        } else {
+            $this->authorizeOrder($order, $request, 'edit_orders');
+        }
 
         $oldStatus = $order->status;
         $order->update(['status' => $validated['status']]);
@@ -604,15 +621,15 @@ class OrderController extends Controller
 
     public function recordPayment(Request $request, Order $order)
     {
-        if ($order->restaurant_id !== auth()->user()->restaurant_id) {
-            abort(403);
-        }
+        $this->authorizeOrder($order, $request, 'edit_orders');
         $validated = $request->validate([
             'amount' => 'required|numeric|min:0',
             'method' => 'required|string|max:50',
             'reference' => 'nullable|string',
             'transaction_id' => 'nullable|string',
         ]);
+        app(JournalPostingService::class)
+            ->assertConfiguredPaymentMethod($order->restaurant_id, $validated['method']);
 
         return DB::transaction(function () use ($order, $request, $validated) {
             $payment = Payment::create([
@@ -636,17 +653,29 @@ class OrderController extends Controller
         }, 5);
     }
 
+    private function authorizeOrder(Order $order, Request $request, string $permission): void
+    {
+        $user = $request->user();
+        abort_unless($order->restaurant_id === $user->restaurant_id, 403);
+        abort_unless($user->hasPermissionTo($permission, 'sanctum'), 403);
+        abort_if(
+            (int) $order->cashier_id !== (int) $user->id
+                && ! $user->hasPermissionTo('view_all_orders', 'sanctum'),
+            403
+        );
+    }
+
     protected function deductInventoryForProduct($productId, $qty, $userId, $orderId)
     {
         $recipe = Recipe::where('product_id', $productId)->where('is_active', true)->first();
-        if (!$recipe) {
+        if (! $recipe) {
             return;
         }
 
         foreach ($recipe->ingredients as $ingredient) {
             $needed = (float) $ingredient->quantity * (float) $qty;
             $item = InventoryItem::find($ingredient->inventory_item_id);
-            if (!$item) {
+            if (! $item) {
                 continue;
             }
             $item->decrement('current_stock', $needed);
@@ -669,22 +698,22 @@ class OrderController extends Controller
     {
         $price = (float) $product->sale_price;
 
-        if (!empty($item['size_id'])) {
+        if (! empty($item['size_id'])) {
             $size = $product->sizes()->whereKey($item['size_id'])->first();
-            if (!$size) {
+            if (! $size) {
                 abort(422, 'المقاس المحدد لا يتبع المنتج');
             }
             $price += (float) $size->price_modifier;
         }
 
         foreach ($item['modifier_options'] ?? [] as $modifierOption) {
-            $modifier = \App\Models\ProductModifier::where('product_id', $product->id)
+            $modifier = ProductModifier::where('product_id', $product->id)
                 ->whereKey($modifierOption['modifier_id'])
                 ->first();
-            $option = \App\Models\ModifierOption::where('modifier_id', $modifierOption['modifier_id'])
+            $option = ModifierOption::where('modifier_id', $modifierOption['modifier_id'])
                 ->whereKey($modifierOption['modifier_option_id'])
                 ->first();
-            if (!$modifier || !$option) {
+            if (! $modifier || ! $option) {
                 abort(422, 'الإضافة المحددة لا تتبع المنتج');
             }
             $price += (float) $option->price_modifier;
@@ -728,19 +757,19 @@ class OrderController extends Controller
                 'updated_at' => $now,
             ]);
 
-        return "ORD-{$date}-" . str_pad((string) $nextSequence, 4, '0', STR_PAD_LEFT);
+        return "ORD-{$date}-".str_pad((string) $nextSequence, 4, '0', STR_PAD_LEFT);
     }
 
     protected function restoreInventoryForProduct($productId, $qty, $userId, $orderId)
     {
         $recipe = Recipe::where('product_id', $productId)->where('is_active', true)->first();
-        if (!$recipe) {
+        if (! $recipe) {
             return;
         }
         foreach ($recipe->ingredients as $ingredient) {
             $restored = (float) $ingredient->quantity * (float) $qty;
             $item = InventoryItem::find($ingredient->inventory_item_id);
-            if (!$item) {
+            if (! $item) {
                 continue;
             }
             $item->increment('current_stock', $restored);

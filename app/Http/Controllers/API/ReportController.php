@@ -181,11 +181,58 @@ class ReportController extends Controller
     public function shifts(Request $request)
     {
         $restaurantId = $request->user()->restaurant_id;
-        $shifts = \App\Models\Shift::where('restaurant_id', $restaurantId)
+        $query = \App\Models\Shift::where('restaurant_id', $restaurantId)
             ->with('user')
             ->orderByDesc('shift_date')
-            ->get();
-        return response()->json(['shifts' => $shifts]);
+            ->orderByDesc('id');
+        if (! $request->user()->hasPermissionTo('view_all_shifts', 'sanctum')) {
+            $query->where('user_id', $request->user()->id);
+        }
+        if ($request->filled('from')) {
+            $query->whereDate('shift_date', '>=', $request->query('from'));
+        }
+        if ($request->filled('to')) {
+            $query->whereDate('shift_date', '<=', $request->query('to'));
+        }
+
+        $shifts = $query->get();
+        $orders = Order::where('restaurant_id', $restaurantId)
+            ->whereIn('shift_id', $shifts->pluck('id'))
+            ->where(function ($orders) {
+                $orders->where('payment_status', 'paid')->orWhere('status', 'completed');
+            })
+            ->get(['id', 'shift_id', 'payment_method', 'total_amount']);
+        $paymentsByOrder = Payment::where('paymentable_type', Order::class)
+            ->whereIn('paymentable_id', $orders->pluck('id'))
+            ->get(['paymentable_id', 'method', 'amount'])
+            ->groupBy('paymentable_id');
+        $ordersByShift = $orders->groupBy('shift_id');
+
+        $rows = $shifts->map(function ($shift) use ($ordersByShift, $paymentsByOrder) {
+            $shiftOrders = $ordersByShift->get($shift->id, collect());
+            $byPayment = [];
+            foreach ($shiftOrders as $order) {
+                $payments = $paymentsByOrder->get($order->id, collect());
+                if ($payments->isNotEmpty()) {
+                    foreach ($payments as $payment) {
+                        $method = $payment->method ?: 'cash';
+                        $byPayment[$method] = ($byPayment[$method] ?? 0) + (float) $payment->amount;
+                    }
+                } else {
+                    $method = $order->payment_method ?: 'cash';
+                    $byPayment[$method] = ($byPayment[$method] ?? 0) + (float) $order->total_amount;
+                }
+            }
+
+            return array_merge($shift->toArray(), [
+                'user_name' => $shift->user?->name,
+                'orders_count' => $shiftOrders->count(),
+                'by_payment_method' => array_map(fn ($amount) => round($amount, 4), $byPayment),
+                'total' => round((float) array_sum($byPayment), 4),
+            ]);
+        });
+
+        return response()->json(['shifts' => $rows]);
     }
 
     public function export(Request $request, $type)

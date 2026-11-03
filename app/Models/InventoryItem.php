@@ -147,12 +147,14 @@ class Purchase extends Model
         'restaurant_id',
         'supplier_id',
         'user_id',
+        'account_id',
         'purchase_number',
         'status',
         'subtotal',
         'tax_amount',
         'total_amount',
         'amount_paid',
+        'payment_method',
         'payment_status',
         'order_date',
         'expected_date',
@@ -183,6 +185,11 @@ class Purchase extends Model
     public function user(): BelongsTo
     {
         return $this->belongsTo(User::class);
+    }
+
+    public function account(): BelongsTo
+    {
+        return $this->belongsTo(Account::class);
     }
 
     public function items()

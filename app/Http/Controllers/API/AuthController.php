@@ -6,10 +6,13 @@ use App\Http\Controllers\Controller;
 use App\Http\Requests\Auth\LoginRequest;
 use App\Http\Resources\UserResource;
 use App\Models\User;
+use App\Services\CashierAccountService;
 use App\Support\PublicMediaUrl;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Storage;
+use Spatie\Permission\Models\Role;
 
 class AuthController extends Controller
 {
@@ -20,18 +23,18 @@ class AuthController extends Controller
             ->orWhere('email', $login)
             ->first();
 
-        if (!$user || !Hash::check($request->password, $user->password)) {
+        if (! $user || ! Hash::check($request->password, $user->password)) {
             return response()->json(['message' => 'بيانات تسجيل الدخول غير صحيحة'], 401);
         }
 
-        if (!$user->is_active) {
+        if (! $user->is_active) {
             return response()->json(['message' => 'الحساب معطل، راجع المشرف'], 403);
         }
 
         $token = $user->createToken('auth_token')->plainTextToken;
 
         return response()->json([
-            'user' => new UserResource($user->load('restaurant', 'roles')),
+            'user' => new UserResource($user->load('restaurant', 'roles', 'vaultAccount', 'payAccount')),
             'token' => $token,
             'message' => 'تم تسجيل الدخول بنجاح',
         ]);
@@ -47,22 +50,33 @@ class AuthController extends Controller
             'phone' => 'nullable|string|max:20',
         ]);
 
-        $user = User::create([
-            'name' => $request->name,
-            'username' => $request->username,
-            'password' => $request->password,
-            'restaurant_id' => $request->restaurant_id,
-            'phone' => $request->phone,
-            'is_active' => true,
-        ]);
+        $roleName = (string) ($request->role ?? 'Cashier');
+        $user = DB::transaction(function () use ($request, $roleName) {
+            $user = User::create([
+                'name' => $request->name,
+                'username' => $request->username,
+                'password' => $request->password,
+                'restaurant_id' => $request->restaurant_id,
+                'phone' => $request->phone,
+                'is_active' => true,
+            ]);
+            $role = Role::where('name', $roleName)
+                ->where('guard_name', 'sanctum')
+                ->firstOrFail();
+            $user->assignRole($role);
+            $accountService = app(CashierAccountService::class);
+            $accountService->ensurePayAccountFor($user);
+            if ($accountService->isCashierRole($role->name)) {
+                $accountService->ensureFor($user);
+            }
 
-        $role = $request->role ?? 'Cashier';
-        $user->assignRole($role, 'sanctum');
+            return $user;
+        });
 
         $token = $user->createToken('auth_token')->plainTextToken;
 
         return response()->json([
-            'user' => new UserResource($user->load('restaurant', 'roles')),
+            'user' => new UserResource($user->load('restaurant', 'roles', 'vaultAccount', 'payAccount')),
             'token' => $token,
             'message' => 'تم إنشاء الحساب بنجاح',
         ], 201);
@@ -71,13 +85,14 @@ class AuthController extends Controller
     public function logout(Request $request)
     {
         $request->user()->currentAccessToken()->delete();
+
         return response()->json(['message' => 'تم تسجيل الخروج بنجاح']);
     }
 
     public function me(Request $request)
     {
         return response()->json([
-            'user' => new UserResource($request->user()->load('restaurant', 'roles')),
+            'user' => new UserResource($request->user()->load('restaurant', 'roles', 'vaultAccount', 'payAccount')),
         ]);
     }
 
@@ -96,7 +111,7 @@ class AuthController extends Controller
         ]);
 
         return response()->json([
-            'user' => new UserResource($user->fresh()->load('restaurant', 'roles')),
+            'user' => new UserResource($user->fresh()->load('restaurant', 'roles', 'vaultAccount', 'payAccount')),
             'message' => 'تم تحديث الصورة الشخصية',
         ]);
     }
@@ -104,7 +119,7 @@ class AuthController extends Controller
     public function restaurant(Request $request)
     {
         $restaurant = $request->user()->restaurant;
-        if (!$restaurant) {
+        if (! $restaurant) {
             return response()->json(['message' => 'لا يوجد مطعم مرتبط بالمستخدم'], 404);
         }
         $data = $restaurant->toArray();

@@ -3,14 +3,23 @@
 namespace App\Http\Controllers\API;
 
 use App\Http\Controllers\Controller;
-use App\Models\Employee;
-use App\Models\User;
+use App\Models\Account;
 use App\Models\Attendance;
+use App\Models\Employee;
+use App\Models\JournalEntry;
 use App\Models\Order;
+use App\Models\Payment;
 use App\Models\Shift;
+use App\Models\ShiftGroup;
+use App\Models\User;
+use App\Services\CashierAccountService;
+use App\Services\JournalPostingService;
+use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Hash;
+use Illuminate\Validation\Rule;
+use Illuminate\Validation\ValidationException;
+use Spatie\Permission\Models\Permission;
 
 class EmployeeController extends Controller
 {
@@ -18,16 +27,21 @@ class EmployeeController extends Controller
     {
         $restaurantId = $request->user()->restaurant_id;
         $employees = Employee::where('restaurant_id', $restaurantId)
-            ->with('user')
+            ->with('user', 'payAccount')
             ->orderBy('name')
-            ->paginate(15);
+            ->paginate(min(max($request->integer('per_page', 15), 1), 100));
+
         return response()->json($employees);
     }
 
     public function store(Request $request)
     {
         $validated = $request->validate([
-            'user_id' => 'nullable|exists:users,id',
+            'user_id' => [
+                'nullable',
+                'integer',
+                Rule::exists('users', 'id')->where('restaurant_id', $request->user()->restaurant_id),
+            ],
             'employee_id' => 'required|string|max:50|unique:employees,employee_id',
             'name' => 'required|string|max:255',
             'job_title' => 'required|string|max:100',
@@ -37,7 +51,14 @@ class EmployeeController extends Controller
             'salary' => 'nullable|numeric|min:0',
             'pay_type' => 'sometimes|in:monthly,daily,percentage',
             'pay_rate' => 'nullable|numeric|min:0',
-            'pay_account_id' => 'nullable|exists:accounts,id',
+            'pay_account_id' => [
+                'nullable',
+                'integer',
+                Rule::exists('accounts', 'id')->where(fn ($query) => $query
+                    ->where('restaurant_id', $request->user()->restaurant_id)
+                    ->where('type', 'expense')
+                    ->where('is_active', true)),
+            ],
             'pay_day' => 'nullable|integer|min:1|max:31',
             'pay_auto' => 'sometimes|boolean',
             'status' => 'sometimes|in:active,on_leave,terminated',
@@ -50,8 +71,55 @@ class EmployeeController extends Controller
         $validated['pay_rate'] = $validated['pay_rate'] ?? 0;
         $validated['pay_auto'] = $request->boolean('pay_auto', true);
         $validated['status'] = $validated['status'] ?? 'active';
-        $employee = Employee::create($validated);
-        return response()->json(['employee' => $employee->load('user'), 'message' => 'تم إضافة الموظف'], 201);
+        $employee = DB::transaction(function () use ($validated) {
+            $user = ! empty($validated['user_id'])
+                ? User::where('restaurant_id', $validated['restaurant_id'])->whereKey($validated['user_id'])->firstOrFail()
+                : null;
+            $validated['pay_account_id'] = $validated['pay_account_id'] ?? $user?->pay_account_id;
+            $employee = Employee::create($validated);
+            if (! $employee->pay_account_id) {
+                $parent = Account::firstOrCreate(
+                    ['restaurant_id' => $employee->restaurant_id, 'code' => '5000'],
+                    ['name' => 'رواتب وأجور', 'type' => 'expense', 'opening_balance' => 0, 'is_active' => true]
+                );
+                if ($parent->type !== 'expense' || ! $parent->is_active) {
+                    throw ValidationException::withMessages([
+                        'pay_account_id' => ['الحساب الافتراضي للأجور غير صالح أو غير نشط.'],
+                    ]);
+                }
+                $typeName = match ($employee->pay_type) {
+                    'daily' => 'يومية',
+                    'percentage' => 'نسبة',
+                    default => 'راتب',
+                };
+                $payAccount = Account::firstOrCreate(
+                    [
+                        'restaurant_id' => $employee->restaurant_id,
+                        'code' => '52'.str_pad((string) $employee->id, 6, '0', STR_PAD_LEFT),
+                    ],
+                    [
+                        'parent_id' => $parent->id,
+                        'name' => 'مصروف '.$typeName.' '.$employee->name,
+                        'type' => 'expense',
+                        'opening_balance' => 0,
+                        'is_active' => true,
+                    ]
+                );
+                if ($payAccount->type !== 'expense' || ! $payAccount->is_active) {
+                    throw ValidationException::withMessages([
+                        'pay_account_id' => ['تعذر إنشاء حساب مصروف صالح للموظف.'],
+                    ]);
+                }
+                $employee->update(['pay_account_id' => $payAccount->id]);
+            }
+            if ($employee->user_id) {
+                User::whereKey($employee->user_id)->update(['pay_account_id' => $employee->pay_account_id]);
+            }
+
+            return $employee;
+        });
+
+        return response()->json(['employee' => $employee->load('user', 'payAccount'), 'message' => 'تم إضافة الموظف'], 201);
     }
 
     public function show(Employee $employee)
@@ -59,7 +127,8 @@ class EmployeeController extends Controller
         if ($employee->restaurant_id !== auth()->user()->restaurant_id) {
             abort(403);
         }
-        return response()->json(['employee' => $employee->load('user', 'attendances')]);
+
+        return response()->json(['employee' => $employee->load('user', 'payAccount', 'attendances')]);
     }
 
     public function update(Request $request, Employee $employee)
@@ -68,17 +137,39 @@ class EmployeeController extends Controller
             abort(403);
         }
         $validated = $request->validate([
+            'user_id' => [
+                'sometimes',
+                'nullable',
+                'integer',
+                Rule::exists('users', 'id')->where('restaurant_id', $employee->restaurant_id),
+            ],
             'job_title' => 'sometimes|string|max:100',
             'salary' => 'sometimes|numeric|min:0',
             'pay_type' => 'sometimes|in:monthly,daily,percentage',
             'pay_rate' => 'sometimes|numeric|min:0',
-            'pay_account_id' => 'sometimes|nullable|exists:accounts,id',
+            'pay_account_id' => [
+                'sometimes',
+                'nullable',
+                'integer',
+                Rule::exists('accounts', 'id')->where(fn ($query) => $query
+                    ->where('restaurant_id', $employee->restaurant_id)
+                    ->where('type', 'expense')
+                    ->where('is_active', true)),
+            ],
             'pay_day' => 'sometimes|nullable|integer|min:1|max:31',
             'pay_auto' => 'sometimes|boolean',
             'status' => 'sometimes|in:active,on_leave,terminated',
         ]);
-        $employee->update($validated);
-        return response()->json(['employee' => $employee->fresh(), 'message' => 'تم تحديث الموظف']);
+        DB::transaction(function () use ($employee, $validated) {
+            $employee->update($validated);
+            if ($employee->user_id && $employee->pay_account_id) {
+                User::where('restaurant_id', $employee->restaurant_id)
+                    ->whereKey($employee->user_id)
+                    ->update(['pay_account_id' => $employee->pay_account_id]);
+            }
+        });
+
+        return response()->json(['employee' => $employee->fresh()->load('user', 'payAccount'), 'message' => 'تم تحديث الموظف']);
     }
 
     public function destroy(Employee $employee)
@@ -87,40 +178,61 @@ class EmployeeController extends Controller
             abort(403);
         }
         $employee->delete();
+
         return response()->json(['message' => 'تم حذف الموظف']);
     }
 
-    public function paySalary(\Illuminate\Http\Request $request, Employee $employee)
+    public function paySalary(Request $request, Employee $employee)
     {
-        if ($employee->restaurant_id !== $request->user()->restaurant_id) abort(403);
+        if ($employee->restaurant_id !== $request->user()->restaurant_id) {
+            abort(403);
+        }
+        abort_unless($request->user()->hasPermissionTo('pay_employee_wages', 'sanctum'), 403);
         if ($employee->pay_type !== 'monthly') {
             return response()->json(['message' => 'هذا الموظف ليس على راتب شهري'], 400);
         }
         $restaurantId = $employee->restaurant_id;
+        $validated = $request->validate([
+            'payment_method' => 'required|string|max:50',
+        ]);
+        app(JournalPostingService::class)
+            ->assertConfiguredPaymentMethod($employee->restaurant_id, $validated['payment_method']);
         $amount = (float) $employee->salary;
-        if ($amount <= 0) return response()->json(['message' => 'الراتب صفر'], 400);
-        $expenseAccount = $employee->pay_account_id
-            ? \App\Models\Account::where('id', $employee->pay_account_id)->where('restaurant_id', $restaurantId)->first()
-            : \App\Models\Account::firstOrCreate(
+        if ($amount <= 0) {
+            return response()->json(['message' => 'الراتب صفر'], 400);
+        }
+        $reference = 'SALARY-'.$employee->id.'-'.now()->format('Y-m');
+        if (JournalEntry::where('restaurant_id', $restaurantId)->where('reference', $reference)->exists()) {
+            return response()->json(['message' => 'تم تسجيل راتب هذا الموظف لهذا الشهر مسبقًا'], 409);
+        }
+        $payAccountId = $employee->pay_account_id ?: $employee->user?->pay_account_id;
+        $expenseAccount = $payAccountId
+            ? Account::where('id', $payAccountId)->where('restaurant_id', $restaurantId)->where('type', 'expense')->where('is_active', true)->first()
+            : Account::firstOrCreate(
                 ['restaurant_id' => $restaurantId, 'code' => '5000'],
                 ['name' => 'رواتب وأجور', 'type' => 'expense', 'opening_balance' => 0, 'is_active' => true]
             );
-        $cashAccount = \App\Models\Account::firstOrCreate(
-            ['restaurant_id' => $restaurantId, 'code' => '1000'],
-            ['name' => 'الخزنة الرئيسية', 'type' => 'asset', 'opening_balance' => 0, 'is_active' => true]
-        );
-        if (!$expenseAccount) return response()->json(['message' => 'حساب غير صالح'], 400);
-        $lastNumber = \App\Models\JournalEntry::where('restaurant_id', $restaurantId)->max('id') ?? 0;
-        $entry = \App\Models\JournalEntry::create([
-            'restaurant_id' => $restaurantId,
-            'entry_number' => 'SAL-' . str_pad((string) ($lastNumber + 1), 6, '0', STR_PAD_LEFT),
-            'entry_date' => now()->toDateString(),
-            'reference' => 'SALARY-' . $employee->id,
-            'description' => 'راتب ' . $employee->name,
-            'created_by' => $request->user()->id,
-        ]);
-        $entry->lines()->create(['account_id' => $expenseAccount->id, 'debit' => $amount, 'credit' => 0, 'description' => 'راتب شهري']);
-        $entry->lines()->create(['account_id' => $cashAccount->id, 'debit' => 0, 'credit' => $amount, 'description' => 'راتب شهري']);
+        if (! $expenseAccount) {
+            return response()->json(['message' => 'حساب غير صالح'], 400);
+        }
+        $entry = DB::transaction(function () use ($request, $employee, $restaurantId, $amount, $expenseAccount, $validated, $reference) {
+            $cashAccount = app(JournalPostingService::class)
+                ->assertConfiguredPaymentMethod($restaurantId, $validated['payment_method']);
+
+            return app(JournalPostingService::class)->post(
+                $restaurantId,
+                'SAL-',
+                $reference,
+                now()->toDateString(),
+                'راتب '.$employee->name,
+                $request->user()->id,
+                [
+                    ['account_id' => $expenseAccount->id, 'debit' => $amount, 'description' => 'راتب شهري'],
+                    ['account_id' => $cashAccount->id, 'credit' => $amount, 'description' => 'راتب شهري'],
+                ]
+            );
+        });
+
         return response()->json(['message' => 'تم دفع الراتب وإنشاء قيد بنجاح', 'entry' => $entry->load('lines.account')]);
     }
 }
@@ -148,7 +260,7 @@ class AttendanceController extends Controller
     {
         $validated = $request->validate([
             'employee_id' => 'required|exists:employees,id',
-            'work_date' => 'required|date|unique:attendances,employee_id,NULL,id,work_date,' . $request->employee_id,
+            'work_date' => 'required|date|unique:attendances,employee_id,NULL,id,work_date,'.$request->employee_id,
             'check_in' => 'nullable|date_format:H:i',
             'check_out' => 'nullable|date_format:H:i',
             'status' => 'sometimes|in:present,absent,late,half_day',
@@ -162,13 +274,14 @@ class AttendanceController extends Controller
 
         $validated['work_hours'] = 0;
         if ($validated['check_in'] && $validated['check_out']) {
-            $start = \Carbon\Carbon::parse($validated['check_in']);
-            $end = \Carbon\Carbon::parse($validated['check_out']);
+            $start = Carbon::parse($validated['check_in']);
+            $end = Carbon::parse($validated['check_out']);
             $validated['work_hours'] = (float) $start->diffInHours($end, true);
         }
         $validated['status'] = $validated['status'] ?? 'present';
 
         $attendance = Attendance::create($validated);
+
         return response()->json(['attendance' => $attendance->load('employee'), 'message' => 'تم تسجيل الحضور'], 201);
     }
 
@@ -177,6 +290,7 @@ class AttendanceController extends Controller
         if ($attendance->employee->restaurant_id !== auth()->user()->restaurant_id) {
             abort(403);
         }
+
         return response()->json(['attendance' => $attendance->load('employee')]);
     }
 
@@ -191,11 +305,12 @@ class AttendanceController extends Controller
             'status' => 'sometimes|in:present,absent,late,half_day',
         ]);
         if ($request->has('check_in') && $request->has('check_out')) {
-            $start = \Carbon\Carbon::parse($request->check_in);
-            $end = \Carbon\Carbon::parse($request->check_out);
+            $start = Carbon::parse($request->check_in);
+            $end = Carbon::parse($request->check_out);
             $validated['work_hours'] = (float) $start->diffInHours($end, true);
         }
         $attendance->update($validated);
+
         return response()->json(['attendance' => $attendance->fresh(), 'message' => 'تم تحديث الحضور']);
     }
 
@@ -205,6 +320,7 @@ class AttendanceController extends Controller
             abort(403);
         }
         $attendance->delete();
+
         return response()->json(['message' => 'تم حذف سجل الحضور']);
     }
 }
@@ -214,12 +330,66 @@ class ShiftController extends Controller
     public function index(Request $request)
     {
         $restaurantId = $request->user()->restaurant_id;
-        $shifts = Shift::where('restaurant_id', $restaurantId)
-            ->with('user', 'employee')
+        abort_unless(
+            $request->user()->hasPermissionTo('view_all_shifts', 'sanctum')
+                || $request->user()->hasPermissionTo('close_shift', 'sanctum'),
+            403
+        );
+        $query = Shift::where('restaurant_id', $restaurantId);
+        if (! $request->user()->hasPermissionTo('view_all_shifts', 'sanctum')) {
+            $query->where('user_id', $request->user()->id);
+        }
+        $shifts = $query
+            ->with('user', 'employee', 'employees', 'group.employees')
             ->orderByDesc('shift_date')
             ->orderByDesc('id')
-            ->paginate($request->get('per_page', 15));
+            ->paginate(min(max($request->integer('per_page', 15), 1), 100));
+        $shifts->getCollection()->each(function (Shift $shift): void {
+            $hasOtherOpenShift = $shift->shift_group_id
+                ? Shift::where('shift_group_id', $shift->shift_group_id)
+                    ->where('status', 'open')
+                    ->where('id', '!=', $shift->id)
+                    ->exists()
+                : false;
+            if ($shift->group) {
+                $shift->setRelation('employees', $shift->group->employees);
+            }
+            $shift->setAttribute('wage_disbursement_due', ! $hasOtherOpenShift);
+        });
+
         return response()->json($shifts);
+    }
+
+    public function options(Request $request)
+    {
+        $user = $request->user();
+        abort_unless($this->userHasShiftPermission($user, 'open_shift'), 403);
+        $canManageEmployees = $this->userHasShiftPermission($user, 'manage_shift_employees');
+        $employees = $canManageEmployees
+            ? Employee::where('restaurant_id', $user->restaurant_id)
+                ->where('status', 'active')
+                ->where('pay_auto', true)
+                ->whereIn('pay_type', ['daily', 'percentage'])
+                ->with('payAccount')
+                ->orderBy('name')
+                ->get()
+            : collect();
+
+        return response()->json([
+            'employees' => $employees,
+            'permissions' => [
+                'manage_shift_employees' => $canManageEmployees,
+                'pay_employee_wages' => $this->userHasShiftPermission($user, 'pay_employee_wages'),
+            ],
+        ]);
+    }
+
+    private function userHasShiftPermission(User $user, string $permission): bool
+    {
+        return Permission::where('name', $permission)
+            ->where('guard_name', 'sanctum')
+            ->exists()
+            && $user->hasPermissionTo($permission, 'sanctum');
     }
 
     public function current(Request $request)
@@ -230,10 +400,85 @@ class ShiftController extends Controller
             ->where('user_id', $user->id)
             ->where('status', 'open')
             ->latest('id')
+            ->with('employees', 'employee')
             ->first();
 
-        if (!$shift) {
-            return response()->json(['shift' => null]);
+        if (! $shift && $user->hasPermissionTo('open_shift', 'sanctum')) {
+            $shift = DB::transaction(function () use ($user, $restaurantId) {
+                $group = ShiftGroup::where('restaurant_id', $restaurantId)
+                    ->where('status', 'open')
+                    ->latest('id')
+                    ->lockForUpdate()
+                    ->first();
+                if (! $group) {
+                    return null;
+                }
+
+                $existing = Shift::where('shift_group_id', $group->id)
+                    ->where('user_id', $user->id)
+                    ->where('status', 'open')
+                    ->first();
+                if ($existing) {
+                    return $existing;
+                }
+
+                return Shift::create([
+                    'restaurant_id' => $restaurantId,
+                    'shift_group_id' => $group->id,
+                    'user_id' => $user->id,
+                    'name' => $group->name,
+                    'shift_date' => $group->shift_date,
+                    'start_time' => now()->format('H:i:s'),
+                    'end_time' => '23:59:00',
+                    'status' => 'open',
+                    'opening_cash' => 0,
+                    'expected_cash' => 0,
+                    'actual_cash' => 0,
+                    'difference' => 0,
+                ]);
+            });
+        }
+
+        if (! $shift) {
+            if (! $user->hasPermissionTo('view_pos', 'sanctum')) {
+                return response()->json([
+                    'shift' => null,
+                    'revenue' => null,
+                    'orders_count' => null,
+                ]);
+            }
+
+            $orders = Order::where('restaurant_id', $restaurantId)
+                ->where('cashier_id', $user->id)
+                ->whereDate('created_at', Carbon::today())
+                ->where(function ($query) {
+                    $query->where('payment_status', 'paid')->orWhere('status', 'completed');
+                })
+                ->get();
+            $orderIds = $orders->pluck('id');
+            $payments = Payment::where('paymentable_type', Order::class)
+                ->whereIn('paymentable_id', $orderIds)
+                ->get();
+            $byPayment = [];
+            foreach ($payments as $payment) {
+                $method = $payment->method ?: 'cash';
+                $byPayment[$method] = ($byPayment[$method] ?? 0) + (float) $payment->amount;
+            }
+            if (empty($byPayment)) {
+                foreach ($orders as $order) {
+                    $method = $order->payment_method ?: 'cash';
+                    $byPayment[$method] = ($byPayment[$method] ?? 0) + (float) $order->total_amount;
+                }
+            }
+
+            return response()->json([
+                'shift' => null,
+                'revenue' => [
+                    'total' => round($orders->sum(fn ($order) => (float) $order->total_amount), 4),
+                    'by_payment_method' => array_map(fn ($amount) => round($amount, 4), $byPayment),
+                ],
+                'orders_count' => $orders->count(),
+            ]);
         }
 
         $ordersQuery = Order::where('restaurant_id', $restaurantId)
@@ -246,9 +491,9 @@ class ShiftController extends Controller
             $q->where('payment_status', 'paid')->orWhere('status', 'completed');
         })->get();
 
-        $total = $orders->sum(fn($o) => (float) $o->total_amount);
+        $total = $orders->sum(fn ($o) => (float) $o->total_amount);
         $orderIds = $orders->pluck('id');
-        $payments = \App\Models\Payment::where('paymentable_type', \App\Models\Order::class)
+        $payments = Payment::where('paymentable_type', Order::class)
             ->whereIn('paymentable_id', $orderIds)
             ->get();
         $byPayment = [];
@@ -262,144 +507,290 @@ class ShiftController extends Controller
                 $byPayment[$method] = ($byPayment[$method] ?? 0) + (float) $order->total_amount;
             }
         }
-        $byPayment = array_map(fn($v) => round($v, 4), $byPayment);
+        $byPayment = array_map(fn ($v) => round($v, 4), $byPayment);
+
+        $groupEmployees = $shift->group?->employees()->get();
+        $hasOtherOpenShift = $shift->shift_group_id
+            ? Shift::where('shift_group_id', $shift->shift_group_id)
+                ->where('status', 'open')
+                ->where('id', '!=', $shift->id)
+                ->exists()
+            : false;
+        if ($groupEmployees) {
+            $shift->setRelation('employees', $groupEmployees);
+        }
 
         return response()->json([
             'shift' => $shift->load('user'),
-            'revenue' => [
+            'wage_disbursement_due' => ! $hasOtherOpenShift,
+            'revenue' => $user->hasPermissionTo('view_pos', 'sanctum') ? [
                 'total' => round($total, 4),
                 'by_payment_method' => $byPayment,
-            ],
-            'orders_count' => $orders->count(),
+            ] : null,
+            'orders_count' => $user->hasPermissionTo('view_pos', 'sanctum') ? $orders->count() : null,
         ]);
     }
 
     public function revenue(Request $request, Shift $shift)
     {
-        if ($shift->restaurant_id !== $request->user()->restaurant_id) {
-            abort(403);
-        }
+        abort_unless($shift->restaurant_id === $request->user()->restaurant_id, 403);
+        abort_unless($request->user()->hasPermissionTo('view_pos', 'sanctum'), 403);
+        abort_unless(
+            (int) $shift->user_id === (int) $request->user()->id
+                || $request->user()->hasPermissionTo('view_all_shifts', 'sanctum'),
+            403
+        );
 
-        $orders = Order::where('restaurant_id', $shift->restaurant_id)
-            ->where('shift_id', $shift->id)
-            ->where(function ($q) {
-                $q->where('payment_status', 'paid')->orWhere('status', 'completed');
-            })
-            ->get();
+        $shifts = $shift->shift_group_id && $request->user()->hasPermissionTo('view_all_shifts', 'sanctum')
+            ? $shift->group->shifts()->with('user')->get()
+            : collect([$shift->load('user')]);
+        $cashiers = $shifts->map(function (Shift $cashierShift) {
+            $orders = Order::where('restaurant_id', $cashierShift->restaurant_id)
+                ->where('shift_id', $cashierShift->id)
+                ->where(function ($query) {
+                    $query->where('payment_status', 'paid')->orWhere('status', 'completed');
+                })
+                ->get();
+            $payments = Payment::where('paymentable_type', Order::class)
+                ->whereIn('paymentable_id', $orders->pluck('id'))
+                ->get();
+            $byPayment = [];
+            foreach ($payments as $payment) {
+                $method = $payment->method ?: 'cash';
+                $byPayment[$method] = ($byPayment[$method] ?? 0) + (float) $payment->amount;
+            }
+            if ($payments->isEmpty()) {
+                foreach ($orders as $order) {
+                    $method = $order->payment_method ?: 'cash';
+                    $byPayment[$method] = ($byPayment[$method] ?? 0) + (float) $order->total_amount;
+                }
+            }
 
-        $total = $orders->sum(fn($o) => (float) $o->total_amount);
-        $orderIds = $orders->pluck('id');
-        $payments = \App\Models\Payment::where('paymentable_type', \App\Models\Order::class)
-            ->whereIn('paymentable_id', $orderIds)
-            ->get();
+            return [
+                'shift_id' => $cashierShift->id,
+                'user_id' => $cashierShift->user_id,
+                'user_name' => $cashierShift->user?->name,
+                'total' => round((float) array_sum($byPayment), 4),
+                'orders_count' => $orders->count(),
+                'by_payment_method' => array_map(fn ($amount) => round($amount, 4), $byPayment),
+            ];
+        })->values();
         $byPayment = [];
-        foreach ($payments as $payment) {
-            $method = $payment->method ?: 'cash';
-            $byPayment[$method] = ($byPayment[$method] ?? 0) + (float) $payment->amount;
-        }
-        if (empty($byPayment)) {
-            foreach ($orders as $order) {
-                $method = $order->payment_method ?: 'cash';
-                $byPayment[$method] = ($byPayment[$method] ?? 0) + (float) $order->total_amount;
+        foreach ($cashiers as $cashier) {
+            foreach ($cashier['by_payment_method'] as $method => $amount) {
+                $byPayment[$method] = ($byPayment[$method] ?? 0) + $amount;
             }
         }
 
         return response()->json([
-            'total' => round($total, 4),
-            'by_payment_method' => array_map(fn($v) => round($v, 4), $byPayment),
-            'orders_count' => $orders->count(),
+            'total' => round((float) $cashiers->sum('total'), 4),
+            'by_payment_method' => array_map(fn ($v) => round($v, 4), $byPayment),
+            'orders_count' => $cashiers->sum('orders_count'),
+            'cashiers' => $cashiers,
         ]);
     }
 
     public function store(Request $request)
     {
+        $actor = $request->user();
+        abort_unless($actor->hasPermissionTo('open_shift', 'sanctum'), 403);
         $validated = $request->validate([
-            'user_id' => 'required|exists:users,id',
-            'employee_id' => 'nullable|exists:employees,id',
+            'employee_ids' => 'sometimes|array',
+            'employee_ids.*' => 'integer|distinct',
             'name' => 'required|string|max:100',
             'shift_date' => 'required|date',
             'start_time' => 'required|date_format:H:i',
             'end_time' => 'nullable|date_format:H:i',
-            'status' => 'sometimes|in:open,closed',
             'opening_cash' => 'nullable|numeric|min:0',
-            'expected_cash' => 'nullable|numeric|min:0',
             'notes' => 'nullable|string',
         ]);
 
-        $restaurantId = $request->user()->restaurant_id;
-
-        // Close any existing open shift for this user before opening a new one.
-        Shift::where('restaurant_id', $restaurantId)
-            ->where('user_id', $validated['user_id'])
-            ->where('status', 'open')
-            ->update([
-                'status' => 'closed',
-                'closed_at' => now(),
-                'end_time' => now()->format('H:i'),
-            ]);
-
-        $validated['restaurant_id'] = $restaurantId;
-        $validated['opening_cash'] = $validated['opening_cash'] ?? 0;
-        $validated['expected_cash'] = $validated['expected_cash'] ?? $validated['opening_cash'];
-        $validated['actual_cash'] = 0;
-        $validated['difference'] = 0;
-        $validated['status'] = $validated['status'] ?? 'open';
-        $validated['start_time'] = \Carbon\Carbon::parse($validated['start_time'])->format('H:i:s');
-        if (!empty($validated['end_time'])) {
-            $validated['end_time'] = \Carbon\Carbon::parse($validated['end_time'])->format('H:i:s');
-        } else {
-            $validated['end_time'] = '23:59:00';
+        $restaurantId = $actor->restaurant_id;
+        $employeeIds = array_values(array_unique(array_map('intval', $validated['employee_ids'] ?? [])));
+        if ($employeeIds && ! $actor->hasPermissionTo('manage_shift_employees', 'sanctum')) {
+            abort(403);
         }
-        $shift = Shift::create($validated);
-        return response()->json(['shift' => $shift->load('user'), 'message' => 'تم فتح الوردية'], 201);
+        if ($employeeIds) {
+            $eligibleIds = Employee::where('restaurant_id', $restaurantId)
+                ->where('status', 'active')
+                ->where('pay_auto', true)
+                ->whereIn('pay_type', ['daily', 'percentage'])
+                ->whereIn('id', $employeeIds)
+                ->pluck('id')
+                ->map(fn ($id) => (int) $id)
+                ->all();
+            if (count($eligibleIds) !== count($employeeIds)) {
+                throw ValidationException::withMessages([
+                    'employee_ids' => ['يمكن اختيار الموظفين النشطين ذوي الأجر اليومي أو النسبة فقط.'],
+                ]);
+            }
+        }
+
+        $result = DB::transaction(function () use ($validated, $employeeIds, $restaurantId, $actor) {
+            $group = ShiftGroup::where('restaurant_id', $restaurantId)
+                ->where('status', 'open')
+                ->latest('id')
+                ->lockForUpdate()
+                ->first();
+
+            if ($group) {
+                if ($employeeIds) {
+                    throw ValidationException::withMessages([
+                        'employee_ids' => ['لا يمكن تغيير موظفي الوردية بعد فتحها.'],
+                    ]);
+                }
+            } else {
+                $group = ShiftGroup::create([
+                    'restaurant_id' => $restaurantId,
+                    'opened_by' => $actor->id,
+                    'name' => $validated['name'],
+                    'shift_date' => $validated['shift_date'],
+                    'status' => 'open',
+                ]);
+                if ($employeeIds) {
+                    $group->employees()->sync($employeeIds);
+                }
+            }
+
+            $shift = Shift::where('shift_group_id', $group->id)
+                ->where('user_id', $actor->id)
+                ->where('status', 'open')
+                ->first();
+            if (! $shift) {
+                $shift = Shift::create([
+                    'restaurant_id' => $restaurantId,
+                    'shift_group_id' => $group->id,
+                    'user_id' => $actor->id,
+                    'name' => $group->name,
+                    'shift_date' => $group->shift_date,
+                    'start_time' => Carbon::parse($validated['start_time'])->format('H:i:s'),
+                    'end_time' => ! empty($validated['end_time'])
+                        ? Carbon::parse($validated['end_time'])->format('H:i:s')
+                        : '23:59:00',
+                    'status' => 'open',
+                    'opening_cash' => (float) ($validated['opening_cash'] ?? 0),
+                    'expected_cash' => (float) ($validated['opening_cash'] ?? 0),
+                    'actual_cash' => 0,
+                    'difference' => 0,
+                    'notes' => $validated['notes'] ?? null,
+                ]);
+            }
+
+            $shift->setRelation('employees', $group->employees()->get());
+
+            return ['group' => $group, 'shift' => $shift->load('user'), 'shifts' => collect([$shift])];
+        });
+
+        return response()->json([
+            'group' => $result['group']->load('employees'),
+            'shift' => $result['shift'],
+            'shifts' => $result['shifts']->values(),
+            'message' => 'تم فتح الوردية الجماعية، ويمكن لكل كاشير الانضمام من جهازه',
+        ], 201);
     }
 
     public function show(Shift $shift)
     {
-        if ($shift->restaurant_id !== auth()->user()->restaurant_id) {
-            abort(403);
-        }
-        return response()->json(['shift' => $shift->load('user', 'employee')]);
+        $user = auth()->user();
+        abort_unless($shift->restaurant_id === $user->restaurant_id, 403);
+        abort_unless(
+            (int) $shift->user_id === (int) $user->id
+                || $user->hasPermissionTo('view_all_shifts', 'sanctum'),
+            403
+        );
+
+        return response()->json(['shift' => $shift->load('user', 'employee', 'employees')]);
     }
 
     public function update(Request $request, Shift $shift)
     {
-        if ($shift->restaurant_id !== auth()->user()->restaurant_id) {
-            abort(403);
+        abort_unless($shift->restaurant_id === $request->user()->restaurant_id, 403);
+        abort_unless(
+            (int) $shift->user_id === (int) $request->user()->id
+                || $request->user()->hasPermissionTo('view_all_shifts', 'sanctum'),
+            403
+        );
+        if ($request->input('status') === 'closed') {
+            abort_unless($request->user()->hasPermissionTo('close_shift', 'sanctum'), 403);
+            $hasOtherOpenShift = $shift->shift_group_id
+                ? Shift::where('shift_group_id', $shift->shift_group_id)
+                    ->where('status', 'open')
+                    ->where('id', '!=', $shift->id)
+                    ->exists()
+                : false;
+            $hasEmployees = $shift->group
+                ? $shift->group->employees()->exists()
+                : ($shift->employees()->exists() || $shift->employee_id);
+            if (! $hasOtherOpenShift && $hasEmployees) {
+                abort_unless($request->user()->hasPermissionTo('pay_employee_wages', 'sanctum'), 403);
+            }
         }
         $validated = $request->validate([
             'actual_cash' => 'sometimes|numeric|min:0',
             'status' => 'sometimes|in:open,closed',
             'notes' => 'sometimes|string',
             'end_time' => 'sometimes|date_format:H:i',
+            'employee_payments' => 'sometimes|array',
+            'employee_payments.*.employee_id' => 'required|integer|distinct',
+            'employee_payments.*.payment_method' => 'required|string|max:50',
         ]);
         $journalCreated = false;
         if ($request->has('status') && $request->status === 'closed') {
-            $cashRevenue = (float) Order::where('shift_id', $shift->id)
-                ->where('payment_method', 'cash')
-                ->where(function ($q) {
-                    $q->where('payment_status', 'paid')->orWhere('status', 'completed');
-                })
-                ->sum('total_amount');
-            $expected = (float) ($shift->opening_cash ?? 0) + $cashRevenue;
-            $validated['expected_cash'] = round($expected, 4);
-            if ($request->has('actual_cash')) {
-                $validated['difference'] = round((float) $validated['actual_cash'] - $expected, 4);
-            }
-            $validated['closed_at'] = now();
-            if (empty($validated['end_time'])) {
-                $validated['end_time'] = now()->format('H:i:s');
-            }
+            DB::transaction(function () use ($request, $shift, &$validated, &$journalCreated) {
+                $lockedShift = Shift::whereKey($shift->id)->lockForUpdate()->firstOrFail();
+                if ($lockedShift->status !== 'open') {
+                    throw ValidationException::withMessages([
+                        'status' => ['هذه الوردية مغلقة بالفعل.'],
+                    ]);
+                }
+                $group = $lockedShift->shift_group_id
+                    ? ShiftGroup::whereKey($lockedShift->shift_group_id)->lockForUpdate()->first()
+                    : null;
+                $hasOtherOpenShift = $group
+                    ? Shift::where('shift_group_id', $group->id)
+                        ->where('status', 'open')
+                        ->where('id', '!=', $lockedShift->id)
+                        ->exists()
+                    : false;
+                $groupEmployees = $group?->employees()->with('user')->get();
+                if ($groupEmployees && $groupEmployees->isNotEmpty() && ! $hasOtherOpenShift) {
+                    abort_unless($request->user()->hasPermissionTo('pay_employee_wages', 'sanctum'), 403);
+                }
+                $cashOrders = Order::where('restaurant_id', $shift->restaurant_id)
+                    ->where('shift_id', $shift->id)
+                    ->where(function ($q) {
+                        $q->where('payment_status', 'paid')->orWhere('status', 'completed');
+                    })
+                    ->get();
+                $cashOrderIds = $cashOrders->pluck('id');
+                $cashPayments = Payment::where('paymentable_type', Order::class)
+                    ->whereIn('paymentable_id', $cashOrderIds)
+                    ->get();
+                $cashRevenue = $cashPayments->isNotEmpty()
+                    ? (float) $cashPayments
+                        ->filter(fn ($payment) => in_array(mb_strtolower(trim($payment->method ?: 'cash')), ['cash', 'نقد', 'نقدي', 'cashbox'], true))
+                        ->sum('amount')
+                    : (float) $cashOrders
+                        ->filter(fn ($order) => in_array(mb_strtolower(trim($order->payment_method ?: 'cash')), ['cash', 'نقد', 'نقدي', 'cashbox'], true))
+                        ->sum('total_amount');
+                $expected = (float) ($shift->opening_cash ?? 0) + $cashRevenue;
+                $validated['expected_cash'] = round($expected, 4);
+                if ($request->has('actual_cash')) {
+                    $validated['difference'] = round((float) $validated['actual_cash'] - $expected, 4);
+                }
+                $validated['closed_at'] = now();
+                if (empty($validated['end_time'])) {
+                    $validated['end_time'] = now()->format('H:i:s');
+                }
 
-            $journalCreated = false;
-            // Auto-create journal entry for shift revenue, linked to accounts
-            try {
-                $orders = \App\Models\Order::where('shift_id', $shift->id)
+                $journalCreated = false;
+                // Auto-create journal entry for shift revenue, linked to accounts
+                $orders = Order::where('shift_id', $shift->id)
                     ->where(function ($q) {
                         $q->where('payment_status', 'paid')->orWhere('status', 'completed');
                     })->get();
                 $orderIds = $orders->pluck('id');
-                $payments = \App\Models\Payment::where('paymentable_type', \App\Models\Order::class)
+                $payments = Payment::where('paymentable_type', Order::class)
                     ->whereIn('paymentable_id', $orderIds)->get();
                 $byPayment = [];
                 foreach ($payments as $p) {
@@ -412,116 +803,185 @@ class ShiftController extends Controller
                 }
 
                 $restaurantId = $shift->restaurant_id;
-                $revenueAccount = \App\Models\Account::firstOrCreate(
+                $cashier = User::where('id', $shift->user_id)
+                    ->where('restaurant_id', $restaurantId)
+                    ->firstOrFail();
+                app(CashierAccountService::class)->ensureFor($cashier);
+                $vaultAccountId = $cashier->vault_account_id;
+                $revenueAccount = Account::firstOrCreate(
                     ['restaurant_id' => $restaurantId, 'code' => '4000'],
                     ['name' => 'إيرادات المبيعات', 'type' => 'revenue', 'opening_balance' => 0, 'is_active' => true]
                 );
-
-                $paymentSettings = \App\Models\Setting::where('restaurant_id', $restaurantId)
-                    ->where('group', 'pos')->where('key', 'payment_methods')->value('value');
-                $methodAccounts = [];
-                if ($paymentSettings) {
-                    $decoded = json_decode($paymentSettings, true);
-                    if (is_array($decoded)) {
-                        foreach ($decoded as $pm) {
-                            if (!empty($pm['account_id'])) {
-                                $methodAccounts[$pm['value'] ?? $pm['method'] ?? ''] = (int) $pm['account_id'];
-                            }
-                        }
-                    }
+                if ($revenueAccount->type !== 'revenue' || ! $revenueAccount->is_active) {
+                    throw ValidationException::withMessages([
+                        'account_id' => ['حساب إيرادات المبيعات غير صالح أو غير نشط.'],
+                    ]);
                 }
 
+                $posting = app(JournalPostingService::class);
                 $lines = [];
-                $totalRevenue = 0;
+                $settlementLines = [];
+                $totalRevenue = 0.0;
                 foreach ($byPayment as $method => $amount) {
-                    if ((float) $amount <= 0) continue;
-                    $accountId = $methodAccounts[$method] ?? null;
-                    if (!$accountId) {
-                        $defaultCode = $method === 'cash' ? '1000' : '1010';
-                        $defaultName = $method === 'cash' ? 'الخزنة الرئيسية' : 'البنك';
-                        $defaultAccount = \App\Models\Account::firstOrCreate(
-                            ['restaurant_id' => $restaurantId, 'code' => $defaultCode],
-                            ['name' => $defaultName, 'type' => 'asset', 'opening_balance' => 0, 'is_active' => true]
-                        );
-                        $accountId = $defaultAccount->id;
+                    $amount = round((float) $amount, 2);
+                    if ($amount <= 0) {
+                        continue;
                     }
-                    $lines[] = ['account_id' => $accountId, 'debit' => (float) $amount, 'credit' => 0, 'description' => 'إيراد وردية - ' . $method];
+                    $methodAccount = $posting->paymentAccount($restaurantId, $method);
+                    $lines[] = ['account_id' => $vaultAccountId, 'debit' => $amount, 'description' => 'تحصيل وردية في خزنة '.$cashier->name.' - '.$method];
+                    $lines[] = ['account_id' => $revenueAccount->id, 'credit' => $amount, 'description' => 'إيراد مبيعات - '.$method];
+                    $settlementLines[] = ['account_id' => $methodAccount->id, 'debit' => $amount, 'description' => 'توريد الوردية إلى '.$methodAccount->name];
+                    $settlementLines[] = ['account_id' => $vaultAccountId, 'credit' => $amount, 'description' => 'تسليم من خزنة '.$cashier->name.' - '.$method];
                     $totalRevenue += (float) $amount;
                 }
                 if ($totalRevenue > 0) {
-                    $lines[] = ['account_id' => $revenueAccount->id, 'debit' => 0, 'credit' => $totalRevenue, 'description' => 'إيراد وردية #' . $shift->id];
-                    $lastNumber = \App\Models\JournalEntry::where('restaurant_id', $restaurantId)->max('id') ?? 0;
-                    $entry = \App\Models\JournalEntry::create([
-                        'restaurant_id' => $restaurantId,
-                        'entry_number' => 'SH-' . str_pad((string) ($lastNumber + 1), 6, '0', STR_PAD_LEFT),
-                        'entry_date' => now()->toDateString(),
-                        'reference' => 'SHIFT-' . $shift->id,
-                        'description' => 'قيد إغلاق الوردية #' . $shift->id,
-                        'created_by' => $request->user()->id,
-                    ]);
-                    foreach ($lines as $line) {
-                        $entry->lines()->create($line);
-                    }
+                    $posting->post(
+                        $restaurantId,
+                        'SH-',
+                        'SHIFT-'.$shift->id,
+                        Carbon::parse($shift->shift_date)->toDateString(),
+                        'قيد إغلاق الوردية #'.$shift->id,
+                        $request->user()->id,
+                        array_merge($lines, $settlementLines)
+                    );
                     $journalCreated = true;
                 }
 
-                // Auto-post wages for daily/percentage employees
-                $employees = \App\Models\Employee::where('restaurant_id', $restaurantId)
+                $employees = $group
+                    ? ($hasOtherOpenShift ? collect() : ($groupEmployees ?? collect()))
+                    : $lockedShift->employees()->with('user')->get();
+                $employeeIds = $employees->pluck('id')->map(fn ($id) => (int) $id)->all();
+                if (! $group && ! $employeeIds && $lockedShift->employee_id) {
+                    $employeeIds = [(int) $lockedShift->employee_id];
+                    $employees = Employee::whereIn('id', $employeeIds)->with('user')->get();
+                }
+                $employees = $employees
+                    ->where('restaurant_id', $restaurantId)
                     ->where('status', 'active')
                     ->whereIn('pay_type', ['daily', 'percentage'])
                     ->where('pay_auto', true)
-                    ->get();
-                foreach ($employees as $emp) {
-                    $amount = 0;
-                    if ($emp->pay_type === 'daily') {
-                        $amount = (float) $emp->pay_rate;
-                    } elseif ($emp->pay_type === 'percentage') {
-                        $amount = $totalRevenue * ((float) $emp->pay_rate / 100);
-                    }
-                    if ($amount <= 0) continue;
-                    $expenseAccount = $emp->pay_account_id
-                        ? \App\Models\Account::where('id', $emp->pay_account_id)->where('restaurant_id', $restaurantId)->first()
-                        : \App\Models\Account::firstOrCreate(
-                            ['restaurant_id' => $restaurantId, 'code' => '5000'],
-                            ['name' => 'رواتب وأجور', 'type' => 'expense', 'opening_balance' => 0, 'is_active' => true]
-                        );
-                    $cashAccount = \App\Models\Account::firstOrCreate(
-                        ['restaurant_id' => $restaurantId, 'code' => '1000'],
-                        ['name' => 'الخزنة الرئيسية', 'type' => 'asset', 'opening_balance' => 0, 'is_active' => true]
-                    );
-                    if (!$expenseAccount) continue;
-                    $lastNumber = \App\Models\JournalEntry::where('restaurant_id', $restaurantId)->max('id') ?? 0;
-                    $entry = \App\Models\JournalEntry::create([
-                        'restaurant_id' => $restaurantId,
-                        'entry_number' => 'WG-' . str_pad((string) ($lastNumber + 1), 6, '0', STR_PAD_LEFT),
-                        'entry_date' => now()->toDateString(),
-                        'reference' => 'WAGE-' . $emp->id . '-' . $shift->id,
-                        'description' => 'أجر ' . $emp->name . ' - وردية #' . $shift->id,
-                        'created_by' => $request->user()->id,
+                    ->values();
+                $employeePayments = collect($request->input('employee_payments', []))
+                    ->keyBy(fn ($item) => (int) $item['employee_id']);
+                if ($employees->count() !== count($employeeIds)
+                    || $employeePayments->count() !== $employees->count()
+                    || $employees->contains(fn ($item) => ! $employeePayments->has((int) $item->id))) {
+                    throw ValidationException::withMessages([
+                        'employee_payments' => ['حدد طريقة دفع أجر كل موظف مشارك في الوردية.'],
                     ]);
-                    $entry->lines()->create(['account_id' => $expenseAccount->id, 'debit' => $amount, 'credit' => 0, 'description' => $emp->pay_type]);
-                    $entry->lines()->create(['account_id' => $cashAccount->id, 'debit' => 0, 'credit' => $amount, 'description' => $emp->pay_type]);
                 }
-            } catch (\Throwable $e) {
-                // Do not block shift closing on accounting errors
-            }
+
+                foreach ($employees as $employee) {
+                    $method = $employeePayments->get((int) $employee->id)['payment_method'];
+                    if ($group) {
+                        $group->employees()->updateExistingPivot($employee->id, ['payment_method' => $method]);
+                    } elseif ($lockedShift->employees()->whereKey($employee->id)->exists()) {
+                        $lockedShift->employees()->updateExistingPivot($employee->id, ['payment_method' => $method]);
+                    }
+                    $wageRevenue = $totalRevenue;
+                    if ($group && $employee->pay_type === 'percentage') {
+                        $groupShiftIds = $group->shifts()->pluck('id');
+                        $groupOrders = Order::whereIn('shift_id', $groupShiftIds)
+                            ->where(function ($query) {
+                                $query->where('payment_status', 'paid')->orWhere('status', 'completed');
+                            })
+                            ->get();
+                        $groupPayments = Payment::where('paymentable_type', Order::class)
+                            ->whereIn('paymentable_id', $groupOrders->pluck('id'))
+                            ->get();
+                        $wageRevenue = $groupPayments->isNotEmpty()
+                            ? (float) $groupPayments->sum('amount')
+                            : (float) $groupOrders->sum('total_amount');
+                    }
+                    $amount = $employee->pay_type === 'daily'
+                        ? (float) $employee->pay_rate
+                        : $wageRevenue * ((float) $employee->pay_rate / 100);
+                    $amount = round($amount, 2);
+
+                    if ($amount > 0) {
+                        $expenseAccount = $employee->pay_account_id
+                            ? Account::where('id', $employee->pay_account_id)
+                                ->where('restaurant_id', $restaurantId)
+                                ->where('type', 'expense')
+                                ->where('is_active', true)
+                                ->first()
+                            : ($employee->user?->pay_account_id
+                                ? Account::where('id', $employee->user->pay_account_id)
+                                    ->where('restaurant_id', $restaurantId)
+                                    ->where('type', 'expense')
+                                    ->where('is_active', true)
+                                    ->first()
+                                : Account::firstOrCreate(
+                                    ['restaurant_id' => $restaurantId, 'code' => '5000'],
+                                    ['name' => 'رواتب وأجور', 'type' => 'expense', 'opening_balance' => 0, 'is_active' => true]
+                                ));
+                        if (! $expenseAccount) {
+                            throw ValidationException::withMessages([
+                                'pay_account_id' => ['حساب مصروف الموظف غير صالح أو غير نشط.'],
+                            ]);
+                        }
+
+                        $cashAccount = $posting->paymentAccount($restaurantId, $method);
+                        $workDate = Carbon::parse($shift->shift_date)->toDateString();
+                        $wageReference = $employee->pay_type === 'daily'
+                            ? 'WAGE-'.$employee->id.'-'.$workDate
+                            : 'WAGE-'.$employee->id.'-'.($group ? 'GROUP-'.$group->id : $shift->id);
+                        $alreadyPosted = JournalEntry::where('restaurant_id', $restaurantId)
+                            ->whereDate('entry_date', $workDate)
+                            ->where('reference', 'like', 'WAGE-'.$employee->id.'-%')
+                            ->exists();
+                        if ($employee->pay_type === 'daily' && $alreadyPosted) {
+                            $wageReference = null;
+                        }
+                        if ($wageReference !== null) {
+                            $posting->post(
+                                $restaurantId,
+                                'WG-',
+                                $wageReference,
+                                $workDate,
+                                'أجر '.$employee->name.' - وردية #'.$shift->id,
+                                $request->user()->id,
+                                [
+                                    ['account_id' => $expenseAccount->id, 'debit' => $amount, 'description' => $employee->pay_type],
+                                    ['account_id' => $cashAccount->id, 'credit' => $amount, 'description' => 'دفع الأجر عبر '.$method],
+                                ]
+                            );
+                            $journalCreated = true;
+                        }
+                    }
+                }
+                if (isset($validated['end_time']) && is_string($validated['end_time']) && strlen($validated['end_time']) === 5) {
+                    $validated['end_time'] .= ':00';
+                }
+                $lockedShift->update($validated);
+                if ($group && ! $group->shifts()->where('status', 'open')->exists()) {
+                    $group->update(['status' => 'closed']);
+                }
+            });
+
+            return response()->json([
+                'shift' => $shift->fresh()->load('user'),
+                'message' => $journalCreated ? 'تم إغلاق الوردية وإنشاء قيد الوردية بنجاح' : 'تم إغلاق الوردية',
+            ]);
         } elseif ($request->has('actual_cash')) {
             $expected = (float) ($shift->expected_cash ?? $shift->opening_cash ?? 0);
             $validated['difference'] = (float) $validated['actual_cash'] - $expected;
         }
         if (isset($validated['end_time']) && is_string($validated['end_time']) && strlen($validated['end_time']) === 5) {
-            $validated['end_time'] = $validated['end_time'] . ':00';
+            $validated['end_time'] = $validated['end_time'].':00';
         }
         $shift->update($validated);
+
         return response()->json(['shift' => $shift->fresh()->load('user'), 'message' => $journalCreated ? 'تم إغلاق الوردية وإنشاء قيد الوردية بنجاح' : 'تم إغلاق الوردية']);
     }
 
     public function destroy(Shift $shift)
     {
-        if ($shift->restaurant_id !== auth()->user()->restaurant_id) {
-            abort(403);
-        }
+        $user = auth()->user();
+        abort_unless($shift->restaurant_id === $user->restaurant_id, 403);
+        abort_unless($user->hasPermissionTo('view_all_shifts', 'sanctum'), 403);
         $shift->delete();
+
         return response()->json(['message' => 'تم حذف الوردية']);
     }
 }

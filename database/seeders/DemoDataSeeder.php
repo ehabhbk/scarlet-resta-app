@@ -15,6 +15,7 @@ use App\Models\Supplier;
 use App\Models\InventoryItem;
 use App\Models\Customer;
 use App\Models\User;
+use App\Services\CashierAccountService;
 use App\Models\Employee;
 use Spatie\Permission\Models\Role;
 use Illuminate\Support\Facades\Hash;
@@ -200,6 +201,11 @@ class DemoDataSeeder extends Seeder
             if ($role && !$user->hasRole($jobTitle, 'sanctum')) {
                 $user->assignRole($role);
             }
+            $accountService = app(CashierAccountService::class);
+            $accountService->ensurePayAccountFor($user);
+            if ($accountService->isCashierRole($jobTitle)) {
+                $accountService->ensureFor($user);
+            }
 
             Employee::updateOrCreate(
                 ['restaurant_id' => $restaurant->id, 'employee_id' => 'EMP-' . str_pad($idx + 1, 3, '0', STR_PAD_LEFT)],
@@ -210,6 +216,7 @@ class DemoDataSeeder extends Seeder
                     'phone' => '+9665000001' . str_pad($idx + 1, 3, '0', STR_PAD_LEFT),
                     'hire_date' => now()->subYear(),
                     'salary' => 5000.00,
+                    'pay_account_id' => $user->pay_account_id,
                     'status' => 'active',
                 ]
             );

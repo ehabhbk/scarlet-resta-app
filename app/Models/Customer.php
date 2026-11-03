@@ -131,6 +131,7 @@ class Shift extends Model
 
     protected $fillable = [
         'restaurant_id',
+        'shift_group_id',
         'user_id',
         'employee_id',
         'name',
@@ -170,5 +171,17 @@ class Shift extends Model
     public function employee(): BelongsTo
     {
         return $this->belongsTo(Employee::class);
+    }
+
+    public function employees()
+    {
+        return $this->belongsToMany(Employee::class, 'shift_employee_payments')
+            ->withPivot('payment_method')
+            ->withTimestamps();
+    }
+
+    public function group(): BelongsTo
+    {
+        return $this->belongsTo(ShiftGroup::class, 'shift_group_id');
     }
 }

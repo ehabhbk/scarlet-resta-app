@@ -18,12 +18,31 @@ class UserResource extends JsonResource
             'phone' => $this->phone,
             'avatar' => PublicMediaUrl::make($this->avatar),
             'is_active' => (bool) $this->is_active,
-            'roles' => $this->whenLoaded('roles', fn() => $this->roles->map(fn($r) => [
+            'vault_account_id' => $this->vault_account_id,
+            'pay_account_id' => $this->pay_account_id,
+            'vault_account' => $this->whenLoaded('vaultAccount', fn () => $this->vaultAccount ? [
+                'id' => $this->vaultAccount->id,
+                'code' => $this->vaultAccount->code,
+                'name' => $this->vaultAccount->name,
+                'parent_id' => $this->vaultAccount->parent_id,
+                'type' => $this->vaultAccount->type,
+            ] : null),
+            'pay_account' => $this->whenLoaded('payAccount', fn () => $this->payAccount ? [
+                'id' => $this->payAccount->id,
+                'code' => $this->payAccount->code,
+                'name' => $this->payAccount->name,
+                'type' => $this->payAccount->type,
+            ] : null),
+            'roles' => $this->whenLoaded('roles', fn () => $this->roles->map(fn ($r) => [
                 'id' => $r->id,
                 'name' => $r->name,
                 'guard_name' => $r->guard_name,
             ])),
-            'restaurant' => $this->whenLoaded('restaurant', fn() => $this->restaurant ? [
+            'permissions' => $this->when(
+                $this->resource->exists,
+                fn () => $this->getAllPermissions()->pluck('name')->values()
+            ),
+            'restaurant' => $this->whenLoaded('restaurant', fn () => $this->restaurant ? [
                 'id' => $this->restaurant->id,
                 'name' => $this->restaurant->name,
                 'slug' => $this->restaurant->slug,
