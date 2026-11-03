@@ -21,7 +21,32 @@ class TableController extends Controller
             $query->where('area_id', $request->area_id);
         }
 
-        return response()->json($query->orderBy('name')->paginate(15));
+        $paginated = $query->orderBy('name')->paginate($request->get('per_page', 15));
+
+        // Auto-release occupied tables whose latest served order is older than
+        // the configured number of minutes (0 disables the behaviour).
+        $releaseMinutes = (int) \App\Models\Setting::where('restaurant_id', $restaurantId)
+            ->where('group', 'tables')
+            ->where('key', 'table_release_minutes')
+            ->value('value');
+        if ($releaseMinutes > 0) {
+            foreach ($paginated as $table) {
+                if ($table->status !== 'occupied') {
+                    continue;
+                }
+                $latestServed = \App\Models\Order::where('table_id', $table->id)
+                    ->where('status', 'served')
+                    ->latest('updated_at')
+                    ->first();
+                if ($latestServed && $latestServed->updated_at
+                    && $latestServed->updated_at->lt(now()->subMinutes($releaseMinutes))) {
+                    $table->update(['status' => 'available']);
+                    $table->status = 'available';
+                }
+            }
+        }
+
+        return response()->json($paginated);
     }
 
     public function store(Request $request)
@@ -52,7 +77,7 @@ class TableController extends Controller
         if ($table->restaurant_id !== auth()->user()->restaurant_id) {
             abort(403);
         }
-        return response()->json(['table' => $table->load('area', 'orders')]);
+        return response()->json(['table' => $table->load('area', 'orders.items')]);
     }
 
     public function update(Request $request, Table $table)

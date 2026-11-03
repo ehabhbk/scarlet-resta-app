@@ -586,9 +586,8 @@ class OrderController extends Controller
             $order->completed_at = now();
         }
 
-        if ($validated['status'] === 'served' && $order->table_id) {
-            Table::where('id', $order->table_id)->update(['status' => 'available']);
-        }
+        // Table stays occupied after serving; it is released manually or by the
+        // configured auto-release timer (see TableController::index).
 
         $order->save();
 
