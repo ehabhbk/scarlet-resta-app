@@ -161,3 +161,4 @@ Route::middleware(['auth:sanctum', 'audit'])->prefix('accounting')->group(functi
     Route::get('income-statement', [\App\Http\Controllers\API\AccountingController::class, 'incomeStatement']);
     Route::get('balance-sheet', [\App\Http\Controllers\API\AccountingController::class, 'balanceSheet']);
 });
+Route::middleware(['auth:sanctum', 'audit'])->post('employees/{employee}/pay-salary', [\App\Http\Controllers\API\EmployeeController::class, 'paySalary']);

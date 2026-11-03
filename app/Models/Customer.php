@@ -59,6 +59,11 @@ class Employee extends Model
         'email',
         'hire_date',
         'salary',
+        'pay_type',
+        'pay_rate',
+        'pay_account_id',
+        'pay_day',
+        'pay_auto',
         'status',
         'avatar',
         'notes',
@@ -67,6 +72,9 @@ class Employee extends Model
     protected $casts = [
         'hire_date' => 'date',
         'salary' => 'decimal:4',
+        'pay_rate' => 'decimal:4',
+        'pay_day' => 'integer',
+        'pay_auto' => 'boolean',
     ];
 
     public function restaurant(): BelongsTo
@@ -77,6 +85,11 @@ class Employee extends Model
     public function user(): BelongsTo
     {
         return $this->belongsTo(User::class);
+    }
+
+    public function payAccount(): BelongsTo
+    {
+        return $this->belongsTo(Account::class, 'pay_account_id');
     }
 
     public function attendances()

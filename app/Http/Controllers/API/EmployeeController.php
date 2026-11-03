@@ -35,12 +35,20 @@ class EmployeeController extends Controller
             'email' => 'nullable|email|max:255',
             'hire_date' => 'required|date',
             'salary' => 'nullable|numeric|min:0',
+            'pay_type' => 'sometimes|in:monthly,daily,percentage',
+            'pay_rate' => 'nullable|numeric|min:0',
+            'pay_account_id' => 'nullable|exists:accounts,id',
+            'pay_day' => 'nullable|integer|min:1|max:31',
+            'pay_auto' => 'sometimes|boolean',
             'status' => 'sometimes|in:active,on_leave,terminated',
             'avatar' => 'nullable|string',
             'notes' => 'nullable|string',
         ]);
         $validated['restaurant_id'] = $request->user()->restaurant_id;
         $validated['salary'] = $validated['salary'] ?? 0;
+        $validated['pay_type'] = $validated['pay_type'] ?? 'monthly';
+        $validated['pay_rate'] = $validated['pay_rate'] ?? 0;
+        $validated['pay_auto'] = $request->boolean('pay_auto', true);
         $validated['status'] = $validated['status'] ?? 'active';
         $employee = Employee::create($validated);
         return response()->json(['employee' => $employee->load('user'), 'message' => 'تم إضافة الموظف'], 201);
@@ -62,6 +70,11 @@ class EmployeeController extends Controller
         $validated = $request->validate([
             'job_title' => 'sometimes|string|max:100',
             'salary' => 'sometimes|numeric|min:0',
+            'pay_type' => 'sometimes|in:monthly,daily,percentage',
+            'pay_rate' => 'sometimes|numeric|min:0',
+            'pay_account_id' => 'sometimes|nullable|exists:accounts,id',
+            'pay_day' => 'sometimes|nullable|integer|min:1|max:31',
+            'pay_auto' => 'sometimes|boolean',
             'status' => 'sometimes|in:active,on_leave,terminated',
         ]);
         $employee->update($validated);
@@ -75,6 +88,40 @@ class EmployeeController extends Controller
         }
         $employee->delete();
         return response()->json(['message' => 'تم حذف الموظف']);
+    }
+
+    public function paySalary(\Illuminate\Http\Request $request, Employee $employee)
+    {
+        if ($employee->restaurant_id !== $request->user()->restaurant_id) abort(403);
+        if ($employee->pay_type !== 'monthly') {
+            return response()->json(['message' => 'هذا الموظف ليس على راتب شهري'], 400);
+        }
+        $restaurantId = $employee->restaurant_id;
+        $amount = (float) $employee->salary;
+        if ($amount <= 0) return response()->json(['message' => 'الراتب صفر'], 400);
+        $expenseAccount = $employee->pay_account_id
+            ? \App\Models\Account::where('id', $employee->pay_account_id)->where('restaurant_id', $restaurantId)->first()
+            : \App\Models\Account::firstOrCreate(
+                ['restaurant_id' => $restaurantId, 'code' => '5000'],
+                ['name' => 'رواتب وأجور', 'type' => 'expense', 'opening_balance' => 0, 'is_active' => true]
+            );
+        $cashAccount = \App\Models\Account::firstOrCreate(
+            ['restaurant_id' => $restaurantId, 'code' => '1000'],
+            ['name' => 'الخزنة الرئيسية', 'type' => 'asset', 'opening_balance' => 0, 'is_active' => true]
+        );
+        if (!$expenseAccount) return response()->json(['message' => 'حساب غير صالح'], 400);
+        $lastNumber = \App\Models\JournalEntry::where('restaurant_id', $restaurantId)->max('id') ?? 0;
+        $entry = \App\Models\JournalEntry::create([
+            'restaurant_id' => $restaurantId,
+            'entry_number' => 'SAL-' . str_pad((string) ($lastNumber + 1), 6, '0', STR_PAD_LEFT),
+            'entry_date' => now()->toDateString(),
+            'reference' => 'SALARY-' . $employee->id,
+            'description' => 'راتب ' . $employee->name,
+            'created_by' => $request->user()->id,
+        ]);
+        $entry->lines()->create(['account_id' => $expenseAccount->id, 'debit' => $amount, 'credit' => 0, 'description' => 'راتب شهري']);
+        $entry->lines()->create(['account_id' => $cashAccount->id, 'debit' => 0, 'credit' => $amount, 'description' => 'راتب شهري']);
+        return response()->json(['message' => 'تم دفع الراتب وإنشاء قيد بنجاح', 'entry' => $entry->load('lines.account')]);
     }
 }
 
@@ -416,6 +463,44 @@ class ShiftController extends Controller
                         $entry->lines()->create($line);
                     }
                     $journalCreated = true;
+                }
+
+                // Auto-post wages for daily/percentage employees
+                $employees = \App\Models\Employee::where('restaurant_id', $restaurantId)
+                    ->where('status', 'active')
+                    ->whereIn('pay_type', ['daily', 'percentage'])
+                    ->where('pay_auto', true)
+                    ->get();
+                foreach ($employees as $emp) {
+                    $amount = 0;
+                    if ($emp->pay_type === 'daily') {
+                        $amount = (float) $emp->pay_rate;
+                    } elseif ($emp->pay_type === 'percentage') {
+                        $amount = $totalRevenue * ((float) $emp->pay_rate / 100);
+                    }
+                    if ($amount <= 0) continue;
+                    $expenseAccount = $emp->pay_account_id
+                        ? \App\Models\Account::where('id', $emp->pay_account_id)->where('restaurant_id', $restaurantId)->first()
+                        : \App\Models\Account::firstOrCreate(
+                            ['restaurant_id' => $restaurantId, 'code' => '5000'],
+                            ['name' => 'رواتب وأجور', 'type' => 'expense', 'opening_balance' => 0, 'is_active' => true]
+                        );
+                    $cashAccount = \App\Models\Account::firstOrCreate(
+                        ['restaurant_id' => $restaurantId, 'code' => '1000'],
+                        ['name' => 'الخزنة الرئيسية', 'type' => 'asset', 'opening_balance' => 0, 'is_active' => true]
+                    );
+                    if (!$expenseAccount) continue;
+                    $lastNumber = \App\Models\JournalEntry::where('restaurant_id', $restaurantId)->max('id') ?? 0;
+                    $entry = \App\Models\JournalEntry::create([
+                        'restaurant_id' => $restaurantId,
+                        'entry_number' => 'WG-' . str_pad((string) ($lastNumber + 1), 6, '0', STR_PAD_LEFT),
+                        'entry_date' => now()->toDateString(),
+                        'reference' => 'WAGE-' . $emp->id . '-' . $shift->id,
+                        'description' => 'أجر ' . $emp->name . ' - وردية #' . $shift->id,
+                        'created_by' => $request->user()->id,
+                    ]);
+                    $entry->lines()->create(['account_id' => $expenseAccount->id, 'debit' => $amount, 'credit' => 0, 'description' => $emp->pay_type]);
+                    $entry->lines()->create(['account_id' => $cashAccount->id, 'debit' => 0, 'credit' => $amount, 'description' => $emp->pay_type]);
                 }
             } catch (\Throwable $e) {
                 // Do not block shift closing on accounting errors
