@@ -120,7 +120,7 @@ class ProductController extends Controller
         $restaurantId = $request->user()->restaurant_id;
         $products = Product::where('restaurant_id', $restaurantId)
             ->where('is_available', true)
-            ->with('category')
+            ->with('category', 'sizes', 'modifiers.options')
             ->orderBy('sort_order')
             ->get();
 

@@ -422,9 +422,6 @@ class OrderController extends Controller
         if ($order->restaurant_id !== auth()->user()->restaurant_id) {
             abort(403);
         }
-        if ($order->status === 'completed') {
-            return response()->json(['message' => 'لا يمكن حذف طلب مكتمل'], 400);
-        }
         if ((float) $order->amount_paid > 0) {
             return response()->json(['message' => 'استرداد قيمة الطلب قبل حذفه'], 400);
         }
@@ -453,32 +450,60 @@ class OrderController extends Controller
             return response()->json(['message' => 'لا يمكن استرجاع دفع غير مدفوع'], 400);
         }
         $user = $request->user();
-        $validated = $request->validate(['reason' => 'nullable|string']);
-        return DB::transaction(function () use ($order, $user, $validated, $refundableAmount) {
+        $validated = $request->validate([
+            'reason' => 'nullable|string',
+            'amount' => 'nullable|numeric|min:0.01',
+        ]);
+        $requestedAmount = isset($validated['amount'])
+            ? (float) $validated['amount']
+            : $refundableAmount;
+        if ($requestedAmount > $refundableAmount + 0.0001) {
+            return response()->json(['message' => 'مبلغ الاسترداد أكبر من المبلغ المتاح'], 400);
+        }
+        $refundAmount = min($requestedAmount, $refundableAmount);
+        $isFullRefund = $refundAmount >= $refundableAmount - 0.0001;
+        return DB::transaction(function () use ($order, $user, $validated, $refundAmount, $isFullRefund) {
             if ($order->payment_status === 'refunded') {
                 return response()->json(['message' => 'تم استرداد هذا الطلب مسبقاً'], 400);
             }
             $oldStatus = $order->status;
-            if ($oldStatus !== 'cancelled') {
-                foreach ($order->items as $item) {
-                    $this->restoreInventoryForProduct($item->product_id, $item->quantity, $user->id, $order->id);
-                    Product::where('id', $item->product_id)
-                        ->where('sales_count', '>=', $item->quantity)
-                        ->decrement('sales_count', $item->quantity);
+            if ($isFullRefund) {
+                if ($oldStatus !== 'cancelled') {
+                    foreach ($order->items as $item) {
+                        $this->restoreInventoryForProduct($item->product_id, $item->quantity, $user->id, $order->id);
+                        Product::where('id', $item->product_id)
+                            ->where('sales_count', '>=', $item->quantity)
+                            ->decrement('sales_count', $item->quantity);
+                    }
+                    if ($order->table_id) {
+                        Table::where('id', $order->table_id)->update(['status' => 'available']);
+                    }
                 }
-                if ($order->table_id) {
-                    Table::where('id', $order->table_id)->update(['status' => 'available']);
-                }
+                $order->update([
+                    'status' => 'cancelled',
+                    'payment_status' => 'refunded',
+                    'amount_paid' => 0,
+                    'cancelled_at' => now(),
+                    'cancelled_by' => $user->id,
+                    'cancellation_reason' => $validated['reason'] ?? 'استرجاع',
+                ]);
+                OrderStatusHistory::create([
+                    'order_id' => $order->id,
+                    'old_status' => $oldStatus,
+                    'new_status' => 'cancelled',
+                    'changed_by' => $user->id,
+                    'notes' => 'استرجاع دفع: ' . ($validated['reason'] ?? 'بدون سبب'),
+                ]);
+            } else {
+                $remainingPaid = max(0, (float) $order->amount_paid - $refundAmount);
+                $paymentStatus = $remainingPaid >= (float) $order->total_amount
+                    ? 'paid'
+                    : ($remainingPaid > 0 ? 'partial' : 'unpaid');
+                $order->update([
+                    'amount_paid' => $remainingPaid,
+                    'payment_status' => $paymentStatus,
+                ]);
             }
-            $refundAmount = $refundableAmount;
-            $order->update([
-                'status' => 'cancelled',
-                'payment_status' => 'refunded',
-                'amount_paid' => 0,
-                'cancelled_at' => now(),
-                'cancelled_by' => $user->id,
-                'cancellation_reason' => $validated['reason'] ?? 'استرجاع',
-            ]);
             Payment::create([
                 'restaurant_id' => $order->restaurant_id,
                 'paymentable_type' => Order::class,
@@ -487,16 +512,14 @@ class OrderController extends Controller
                 'method' => $order->payment_method ?: 'cash',
                 'paid_at' => now(),
                 'user_id' => $user->id,
-                'notes' => 'استرداد كامل للطلب: ' . ($validated['reason'] ?? ''),
+                'notes' => ($isFullRefund ? 'استرداد كامل للطلب: ' : 'استرداد جزئي للطلب: ') . ($validated['reason'] ?? ''),
             ]);
-            OrderStatusHistory::create([
-                'order_id' => $order->id,
-                'old_status' => $oldStatus,
-                'new_status' => 'cancelled',
-                'changed_by' => $user->id,
-                'notes' => 'استرجاع دفع: ' . ($validated['reason'] ?? 'بدون سبب'),
+            return response()->json([
+                'order' => $order->fresh(),
+                'message' => $isFullRefund
+                    ? 'تم استرجاع الدفع وإلغاء الطلب'
+                    : 'تم استرداد المبلغ جزئياً',
             ]);
-            return response()->json(['order' => $order->fresh(), 'message' => 'تم استرجاع الدفع وإلغاء الطلب']);
         });
     }
 
