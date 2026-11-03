@@ -2,10 +2,10 @@
 
 namespace App\Http\Services;
 
-use App\Models\Product;
-use App\Models\ProductSize;
-use App\Models\ProductModifier;
 use App\Models\ModifierOption;
+use App\Models\Product;
+use App\Models\ProductModifier;
+use App\Models\ProductSize;
 use Illuminate\Support\Facades\DB;
 
 class ProductService
@@ -16,6 +16,7 @@ class ProductService
             $product = Product::create([
                 'restaurant_id' => $data['restaurant_id'],
                 'category_id' => $data['category_id'] ?? null,
+                'kitchen_station_id' => $data['kitchen_station_id'] ?? null,
                 'name' => $data['name'],
                 'slug' => $data['slug'],
                 'sku' => $data['sku'] ?? null,
@@ -34,7 +35,7 @@ class ProductService
                 'sort_order' => $data['sort_order'] ?? 0,
             ]);
 
-            if (!empty($data['sizes'])) {
+            if (! empty($data['sizes'])) {
                 foreach ($data['sizes'] as $index => $size) {
                     ProductSize::create([
                         'product_id' => $product->id,
@@ -46,7 +47,7 @@ class ProductService
                 }
             }
 
-            if (!empty($data['modifiers'])) {
+            if (! empty($data['modifiers'])) {
                 foreach ($data['modifiers'] as $modifier) {
                     $productModifier = ProductModifier::create([
                         'restaurant_id' => $data['restaurant_id'],
@@ -59,7 +60,7 @@ class ProductService
                         'is_active' => true,
                     ]);
 
-                    if (!empty($modifier['options'])) {
+                    if (! empty($modifier['options'])) {
                         foreach ($modifier['options'] as $optIndex => $opt) {
                             ModifierOption::create([
                                 'modifier_id' => $productModifier->id,
@@ -80,11 +81,12 @@ class ProductService
     public function update(Product $product, array $data): Product
     {
         $product->update(array_intersect_key($data, array_flip([
-            'category_id', 'name', 'slug', 'sku', 'barcode', 'description',
+            'category_id', 'kitchen_station_id', 'name', 'slug', 'sku', 'barcode', 'description',
             'image', 'sale_price', 'cost_price', 'tax_rate', 'track_inventory',
             'current_stock', 'min_stock', 'is_available', 'is_featured',
             'is_best_seller', 'sort_order',
         ])));
+
         return $product->fresh();
     }
 }

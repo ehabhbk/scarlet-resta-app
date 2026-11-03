@@ -176,7 +176,7 @@ class Shift extends Model
     public function employees()
     {
         return $this->belongsToMany(Employee::class, 'shift_employee_payments')
-            ->withPivot('payment_method')
+            ->withPivot('payment_method', 'paid_at', 'paid_amount', 'journal_entry_id', 'paid_by')
             ->withTimestamps();
     }
 

@@ -9,6 +9,7 @@ use App\Support\PublicMediaUrl;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
+use Illuminate\Validation\Rule;
 use App\Http\Services\ProductService;
 use App\Http\Requests\Product\StoreProductRequest;
 use App\Http\Resources\ProductResource;
@@ -68,7 +69,7 @@ class ProductController extends Controller
     public function show(Product $product)
     {
         $this->authorizeRestaurant($product);
-        return new ProductResource($product->load('category', 'sizes', 'modifiers.options'));
+        return new ProductResource($product->load('category', 'kitchenStation', 'sizes', 'modifiers.options'));
     }
 
     public function update(Request $request, Product $product)
@@ -77,6 +78,14 @@ class ProductController extends Controller
 
         $validated = $request->validate([
             'category_id' => 'nullable|exists:categories,id',
+            'kitchen_station_id' => [
+                'sometimes',
+                'nullable',
+                'integer',
+                Rule::exists('kitchen_stations', 'id')->where(fn ($query) => $query
+                    ->where('restaurant_id', $request->user()->restaurant_id)
+                    ->where('is_active', true)),
+            ],
             'name' => 'sometimes|string|max:255',
             'slug' => 'sometimes|string|max:255|unique:products,slug,' . $product->id,
             'sku' => 'sometimes|string|max:100|unique:products,sku,' . $product->id,
@@ -127,6 +136,7 @@ class ProductController extends Controller
         return response()->json([
             'products' => $products->map(function (Product $product) {
                 $product->image = PublicMediaUrl::make($product->image);
+                $product->loadMissing('kitchenStation');
                 return $product;
             }),
         ]);

@@ -5,6 +5,7 @@ namespace App\Http\Controllers\API;
 use App\Http\Controllers\Controller;
 use App\Http\Resources\UserResource;
 use App\Models\Employee;
+use App\Models\KitchenStation;
 use App\Models\User;
 use App\Services\CashierAccountService;
 use App\Support\PublicMediaUrl;
@@ -22,7 +23,7 @@ class UserController extends Controller
     {
         $restaurantId = $request->user()->restaurant_id;
         $users = User::where('restaurant_id', $restaurantId)
-            ->with(['roles', 'vaultAccount', 'payAccount'])
+            ->with(['roles', 'vaultAccount', 'payAccount', 'kitchenStation'])
             ->orderBy('name')
             ->paginate(min(max($request->integer('per_page', 15), 1), 100));
 
@@ -54,6 +55,14 @@ class UserController extends Controller
                     ->where('type', 'expense')
                     ->where('is_active', true)),
             ],
+            'kitchen_station_id' => [
+                'required_if:role,Chef',
+                'nullable',
+                'integer',
+                Rule::exists('kitchen_stations', 'id')->where(fn ($query) => $query
+                    ->where('restaurant_id', $request->user()->restaurant_id)
+                    ->where('is_active', true)),
+            ],
             'image_file' => 'nullable|image|mimes:jpeg,png,jpg,gif,webp|max:2048',
         ]);
         $validated['restaurant_id'] = $request->user()->restaurant_id;
@@ -80,7 +89,7 @@ class UserController extends Controller
         });
 
         return response()->json([
-            'user' => new UserResource($user->fresh()->load(['roles', 'vaultAccount', 'payAccount'])),
+            'user' => new UserResource($user->fresh()->load(['roles', 'vaultAccount', 'payAccount', 'kitchenStation'])),
             'message' => 'تم إضافة المستخدم',
         ], 201);
     }
@@ -91,7 +100,7 @@ class UserController extends Controller
             abort(403);
         }
 
-        return response()->json(['user' => new UserResource($user->load(['roles', 'vaultAccount', 'payAccount']))]);
+        return response()->json(['user' => new UserResource($user->load(['roles', 'vaultAccount', 'payAccount', 'kitchenStation']))]);
     }
 
     public function update(Request $request, User $user)
@@ -122,6 +131,15 @@ class UserController extends Controller
                 Rule::exists('accounts', 'id')->where(fn ($query) => $query
                     ->where('restaurant_id', $user->restaurant_id)
                     ->where('type', 'expense')
+                    ->where('is_active', true)),
+            ],
+            'kitchen_station_id' => [
+                'sometimes',
+                'required_if:role,Chef',
+                'nullable',
+                'integer',
+                Rule::exists('kitchen_stations', 'id')->where(fn ($query) => $query
+                    ->where('restaurant_id', $user->restaurant_id)
                     ->where('is_active', true)),
             ],
             'image_file' => 'sometimes|image|mimes:jpeg,png,jpg,gif,webp|max:2048',
@@ -156,7 +174,7 @@ class UserController extends Controller
         });
 
         return response()->json([
-            'user' => new UserResource($user->fresh()->load(['roles', 'vaultAccount', 'payAccount'])),
+            'user' => new UserResource($user->fresh()->load(['roles', 'vaultAccount', 'payAccount', 'kitchenStation'])),
             'message' => 'تم تحديث المستخدم',
         ]);
     }

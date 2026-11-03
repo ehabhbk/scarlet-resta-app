@@ -51,7 +51,7 @@ class DatabaseSeeder extends Seeder
             // Tables
             'view_tables', 'create_tables', 'edit_tables', 'delete_tables',
             // Kitchen
-            'view_kitchen', 'update_kitchen_order',
+            'view_kitchen', 'view_all_kitchen_orders', 'view_station_kitchen_orders', 'update_kitchen_order',
             // Inventory
             'view_inventory', 'create_inventory', 'edit_inventory', 'delete_inventory',
             // Recipes
@@ -88,7 +88,7 @@ class DatabaseSeeder extends Seeder
             'Manager' => ['view_dashboard','view_products','create_products','edit_products','view_categories','create_categories','edit_categories','view_orders','view_all_orders','create_orders','edit_orders','delete_orders','cancel_orders','refund_orders','view_tables','edit_tables','view_kitchen','update_kitchen_order','view_inventory','create_inventory','edit_inventory','view_recipes','create_recipes','edit_recipes','view_purchases','create_purchases','edit_purchases','view_suppliers','create_suppliers','edit_suppliers','view_customers','create_customers','edit_customers','view_employees','create_employees','edit_employees','view_finance','create_expenses','edit_expenses','view_payments','open_shift','close_shift','view_pos','manage_multi_cashier_shifts','manage_shift_employees','pay_employee_wages','view_all_shifts','view_reports','export_reports','view_settings','edit_settings','view_users','create_users','edit_users','view_roles','create_roles','edit_roles'],
             'Cashier' => ['view_dashboard','view_products','view_categories','view_orders','create_orders','edit_orders','view_tables','edit_tables','view_kitchen','view_customers','create_customers','view_finance','view_payments','open_shift','close_shift','view_pos'],
             'Waiter' => ['view_dashboard','view_products','view_categories','create_orders','edit_orders','view_tables','edit_tables','view_kitchen','view_customers','create_customers'],
-            'Chef' => ['view_kitchen','update_kitchen_order','view_products'],
+            'Chef' => ['view_kitchen','view_station_kitchen_orders','update_kitchen_order','view_products'],
             'Accountant' => ['view_dashboard','view_finance','create_expenses','edit_expenses','view_payments','open_shift','close_shift','pay_employee_wages','view_all_shifts','refund_orders','view_reports','export_reports','view_purchases','view_suppliers'],
             'Inventory Manager' => ['view_inventory','create_inventory','edit_inventory','view_purchases','create_purchases','edit_purchases','view_suppliers','create_suppliers','edit_suppliers','view_recipes','create_recipes','edit_recipes'],
         ];

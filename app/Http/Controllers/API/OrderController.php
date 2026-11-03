@@ -10,6 +10,7 @@ use App\Models\ModifierOption;
 use App\Models\Order;
 use App\Models\OrderItem;
 use App\Models\OrderItemModifier;
+use App\Models\OrderKitchenStation;
 use App\Models\OrderStatusHistory;
 use App\Models\Payment;
 use App\Models\Product;
@@ -203,6 +204,12 @@ class OrderController extends Controller
                     'kitchen_status' => 'pending',
                     'sort_order' => $sort++,
                 ]);
+                if ($product->kitchen_station_id) {
+                    OrderKitchenStation::create([
+                        'order_item_id' => $orderItem->id,
+                        'station_id' => $product->kitchen_station_id,
+                    ]);
+                }
 
                 // Modifiers
                 if (! empty($itemData['modifier_options'])) {
@@ -354,6 +361,12 @@ class OrderController extends Controller
                         'kitchen_status' => 'pending',
                         'sort_order' => $sort,
                     ]);
+                    if ($product->kitchen_station_id) {
+                        OrderKitchenStation::create([
+                            'order_item_id' => $item->id,
+                            'station_id' => $product->kitchen_station_id,
+                        ]);
+                    }
 
                     foreach ($itemData['modifier_options'] ?? [] as $modifierOption) {
                         $option = ModifierOption::findOrFail($modifierOption['modifier_option_id']);
@@ -592,6 +605,26 @@ class OrderController extends Controller
 
         if ($validated['status'] === 'served' && $request->user()->hasPermissionTo('update_kitchen_order', 'sanctum')) {
             abort_unless($order->restaurant_id === $request->user()->restaurant_id, 404);
+            abort_unless(
+                ! $order->items()
+                    ->where(function ($query) {
+                        $query->whereNull('kitchen_status')
+                            ->orWhereNotIn('kitchen_status', ['ready', 'served']);
+                    })
+                    ->exists(),
+                422,
+                'لا يمكن تسليم الطلب قبل جاهزية جميع الأصناف.'
+            );
+            if (! $request->user()->hasPermissionTo('view_all_kitchen_orders', 'sanctum')
+                && $request->user()->hasPermissionTo('view_station_kitchen_orders', 'sanctum')) {
+                abort_unless(
+                    $request->user()->kitchen_station_id
+                        && $order->items()->whereHas('kitchenStations', fn ($query) => $query
+                            ->where('station_id', $request->user()->kitchen_station_id))
+                            ->exists(),
+                    403
+                );
+            }
         } else {
             $this->authorizeOrder($order, $request, 'edit_orders');
         }

@@ -14,6 +14,7 @@ class Product extends Model
     protected $fillable = [
         'restaurant_id',
         'category_id',
+        'kitchen_station_id',
         'name',
         'slug',
         'sku',
@@ -55,6 +56,11 @@ class Product extends Model
     public function category(): BelongsTo
     {
         return $this->belongsTo(Category::class);
+    }
+
+    public function kitchenStation(): BelongsTo
+    {
+        return $this->belongsTo(KitchenStation::class, 'kitchen_station_id');
     }
 
     public function sizes()

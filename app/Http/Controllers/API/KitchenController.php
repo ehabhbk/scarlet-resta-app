@@ -15,15 +15,47 @@ class KitchenController extends Controller
 {
     public function index(Request $request)
     {
-        $restaurantId = $request->user()->restaurant_id;
+        $user = $request->user();
+        $restaurantId = $user->restaurant_id;
+        $canViewAll = $this->canViewAllOrders($user);
+        abort_unless(
+            $canViewAll || ($user->hasPermissionTo('view_station_kitchen_orders', 'sanctum') && $user->kitchen_station_id),
+            403
+        );
+        $stationId = $canViewAll ? null : $user->kitchen_station_id;
 
         $orders = Order::where('restaurant_id', $restaurantId)
             ->whereIn('status', ['pending', 'confirmed', 'preparing', 'ready'])
-            ->with(['items.product', 'items.kitchenStations.station', 'table'])
+            ->withCount(['items as unready_kitchen_items_count' => fn ($query) => $query
+                ->where(fn ($status) => $status
+                    ->whereNull('kitchen_status')
+                    ->orWhereNotIn('kitchen_status', ['ready', 'served']))])
+            ->when($stationId, fn ($query) => $query->whereHas('items.kitchenStations', fn ($stations) => $stations->where('station_id', $stationId)))
+            ->with([
+                'items' => function ($query) use ($stationId) {
+                    $query->with(['product', 'kitchenStations.station']);
+                    if ($stationId) {
+                        $query->whereHas('kitchenStations', fn ($stations) => $stations->where('station_id', $stationId));
+                    }
+                },
+                'table',
+            ])
             ->orderBy('created_at')
             ->get();
 
         $grouped = $orders->map(function ($order) {
+            $stations = $order->items
+                ->flatMap(fn ($item) => $item->kitchenStations)
+                ->pluck('station')
+                ->filter()
+                ->unique('id')
+                ->map(fn ($station) => [
+                    'id' => $station->id,
+                    'name' => $station->display_name ?: $station->name,
+                    'color' => $station->color,
+                ])
+                ->values();
+
             return [
                 'id' => $order->id,
                 'order_number' => $order->order_number,
@@ -31,6 +63,8 @@ class KitchenController extends Controller
                 'table' => optional($order->table)->name,
                 'status' => $order->status,
                 'created_at' => $order->created_at,
+                'can_mark_served' => (int) $order->unready_kitchen_items_count === 0,
+                'stations' => $stations,
                 'items' => $order->items->map(function ($item) {
                     return [
                         'id' => $item->id,
@@ -40,7 +74,8 @@ class KitchenController extends Controller
                         'notes' => $item->notes,
                         'stations' => $item->kitchenStations->map(function ($ks) {
                             return [
-                                'station' => $ks->station->name,
+                                'station' => $ks->station->display_name ?: $ks->station->name,
+                                'station_id' => $ks->station->id,
                                 'station_color' => $ks->station->color,
                                 'prep_time_minutes' => $ks->prep_time_minutes,
                                 'started_at' => $ks->started_at,
@@ -57,11 +92,22 @@ class KitchenController extends Controller
 
     public function stations(Request $request)
     {
-        $restaurantId = $request->user()->restaurant_id;
-        $stations = KitchenStation::where('restaurant_id', $restaurantId)
+        $user = $request->user();
+        $stations = KitchenStation::where('restaurant_id', $user->restaurant_id)
+            ->when(! $this->canViewAllOrders($user) && $user->kitchen_station_id, fn ($query) => $query->whereKey($user->kitchen_station_id))
             ->orderBy('sort_order')
             ->get();
         return response()->json(['stations' => $stations]);
+    }
+
+    public function stationsForAssignment(Request $request)
+    {
+        return response()->json([
+            'stations' => KitchenStation::where('restaurant_id', $request->user()->restaurant_id)
+                ->where('is_active', true)
+                ->orderBy('sort_order')
+                ->get(),
+        ]);
     }
 
     public function storeStation(Request $request)
@@ -118,6 +164,11 @@ class KitchenController extends Controller
         if ($station->restaurant_id !== auth()->user()->restaurant_id) {
             abort(403);
         }
+        abort_unless(
+            $this->canViewAllOrders($request->user())
+                || (int) $request->user()->kitchen_station_id === (int) $station->id,
+            403
+        );
 
         return DB::transaction(function () use ($orderItem, $validated) {
             OrderKitchenStation::updateOrCreate(
@@ -141,6 +192,20 @@ class KitchenController extends Controller
 
         $status = $validated['kitchen_status'] ?? $validated['status'];
         $stationId = $validated['station_id'] ?? null;
+        if (! $this->canViewAllOrders($request->user())) {
+            abort_unless(
+                $request->user()->hasPermissionTo('view_station_kitchen_orders', 'sanctum')
+                    && $request->user()->kitchen_station_id
+                    && (int) $request->user()->kitchen_station_id === (int) $stationId,
+                403
+            );
+            abort_unless(
+                OrderKitchenStation::where('order_item_id', $orderItem->id)
+                    ->where('station_id', $stationId)
+                    ->exists(),
+                403
+            );
+        }
 
         if ($stationId !== null) {
             $stationBelongsToRestaurant = KitchenStation::where('restaurant_id', $request->user()->restaurant_id)
@@ -177,6 +242,11 @@ class KitchenController extends Controller
         $validated = $request->validate([
             'station_id' => 'required|exists:kitchen_stations,id',
         ]);
+        abort_unless(
+            $this->canViewAllOrders($request->user())
+                || (int) $request->user()->kitchen_station_id === (int) $validated['station_id'],
+            403
+        );
         OrderKitchenStation::updateOrCreate(
             ['order_item_id' => $orderItem->id, 'station_id' => $validated['station_id']],
             ['started_at' => now()]
@@ -192,9 +262,21 @@ class KitchenController extends Controller
         $validated = $request->validate([
             'station_id' => 'required|exists:kitchen_stations,id',
         ]);
+        abort_unless(
+            $this->canViewAllOrders($request->user())
+                || (int) $request->user()->kitchen_station_id === (int) $validated['station_id'],
+            403
+        );
         OrderKitchenStation::where('order_item_id', $orderItem->id)
             ->where('station_id', $validated['station_id'])
             ->update(['completed_at' => now()]);
         return response()->json(['message' => 'أكتمل التحضير']);
+    }
+
+    private function canViewAllOrders($user): bool
+    {
+        return $user->hasPermissionTo('view_all_kitchen_orders', 'sanctum')
+            || ($user->hasPermissionTo('view_kitchen', 'sanctum')
+                && ! $user->hasPermissionTo('view_station_kitchen_orders', 'sanctum'));
     }
 }

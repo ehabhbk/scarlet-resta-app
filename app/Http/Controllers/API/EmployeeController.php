@@ -384,6 +384,201 @@ class ShiftController extends Controller
         ]);
     }
 
+    public function employeeWages(Request $request, Shift $shift)
+    {
+        abort_unless($shift->restaurant_id === $request->user()->restaurant_id, 403);
+        abort_unless($request->user()->hasPermissionTo('pay_employee_wages', 'sanctum'), 403);
+        abort_unless($shift->status === 'open', 422, 'لا يمكن دفع أجور وردية مغلقة.');
+
+        $group = $shift->group;
+        $employees = $this->employeesForWages($shift, $group);
+        $revenue = $this->wageRevenue($shift, $group);
+        $workDate = Carbon::parse($shift->shift_date)->toDateString();
+
+        $wages = $employees
+            ->where('restaurant_id', $shift->restaurant_id)
+            ->where('status', 'active')
+            ->where('pay_auto', true)
+            ->whereIn('pay_type', ['daily', 'percentage'])
+            ->map(function (Employee $employee) use ($revenue, $workDate, $shift, $group): array {
+                $amount = $employee->pay_type === 'daily'
+                    ? (float) $employee->pay_rate
+                    : $revenue * ((float) $employee->pay_rate / 100);
+                $reference = $this->wageReference($employee, $workDate, $shift, $group);
+                $existingEntry = JournalEntry::where('restaurant_id', $shift->restaurant_id)
+                    ->where('reference', $reference)
+                    ->first();
+
+                return [
+                    'id' => $employee->id,
+                    'name' => $employee->name,
+                    'pay_type' => $employee->pay_type,
+                    'pay_rate' => (float) $employee->pay_rate,
+                    'amount' => round($amount, 2),
+                    'payment_method' => $employee->pivot->payment_method,
+                    'paid_at' => $employee->pivot->paid_at ?: $existingEntry?->created_at,
+                    'journal_entry_id' => $employee->pivot->journal_entry_id ?: $existingEntry?->id,
+                ];
+            })
+            ->filter(fn (array $wage) => ! $wage['paid_at'])
+            ->values();
+
+        return response()->json(['employees' => $wages]);
+    }
+
+    public function payEmployeeWage(Request $request, Shift $shift)
+    {
+        abort_unless($shift->restaurant_id === $request->user()->restaurant_id, 403);
+        abort_unless($request->user()->hasPermissionTo('pay_employee_wages', 'sanctum'), 403);
+        $validated = $request->validate([
+            'employee_id' => 'required|integer',
+            'payment_method' => 'required|string|max:50',
+        ]);
+
+        $entry = DB::transaction(function () use ($request, $shift, $validated): JournalEntry {
+            $lockedShift = Shift::whereKey($shift->id)->lockForUpdate()->firstOrFail();
+            if ($lockedShift->status !== 'open') {
+                throw ValidationException::withMessages([
+                    'shift' => ['لا يمكن دفع أجر موظف من وردية مغلقة.'],
+                ]);
+            }
+
+            $group = $lockedShift->shift_group_id
+                ? ShiftGroup::whereKey($lockedShift->shift_group_id)->lockForUpdate()->first()
+                : null;
+            $employees = $this->employeesForWages($lockedShift, $group);
+            $employee = $employees->firstWhere('id', (int) $validated['employee_id']);
+            if (! $employee
+                || $employee->restaurant_id !== $lockedShift->restaurant_id
+                || $employee->status !== 'active'
+                || ! $employee->pay_auto
+                || ! in_array($employee->pay_type, ['daily', 'percentage'], true)) {
+                throw ValidationException::withMessages([
+                    'employee_id' => ['الموظف غير مشارك في هذه الوردية أو لا يستحق أجراً تلقائياً.'],
+                ]);
+            }
+
+            $workDate = Carbon::parse($lockedShift->shift_date)->toDateString();
+            $reference = $this->wageReference($employee, $workDate, $lockedShift, $group);
+            if ($employee->pivot->paid_at) {
+                throw ValidationException::withMessages([
+                    'employee_id' => ['تم دفع أجر هذا الموظف مسبقاً.'],
+                ]);
+            }
+
+            $amount = $employee->pay_type === 'daily'
+                ? (float) $employee->pay_rate
+                : $this->wageRevenue($lockedShift, $group) * ((float) $employee->pay_rate / 100);
+            $amount = round($amount, 2);
+            if ($amount <= 0) {
+                throw ValidationException::withMessages([
+                    'employee_id' => ['قيمة أجر الموظف تساوي صفراً ولا يمكن إنشاء قيد.'],
+                ]);
+            }
+
+            $posting = app(JournalPostingService::class);
+            $paymentAccount = $posting->assertConfiguredPaymentMethod(
+                $lockedShift->restaurant_id,
+                $validated['payment_method'],
+            );
+            $expenseAccountId = $employee->pay_account_id ?: $employee->user?->pay_account_id;
+            $expenseAccount = $expenseAccountId
+                ? Account::where('restaurant_id', $lockedShift->restaurant_id)
+                    ->whereKey($expenseAccountId)
+                    ->where('type', 'expense')
+                    ->where('is_active', true)
+                    ->first()
+                : Account::firstOrCreate(
+                    ['restaurant_id' => $lockedShift->restaurant_id, 'code' => '5000'],
+                    ['name' => 'رواتب وأجور', 'type' => 'expense', 'opening_balance' => 0, 'is_active' => true],
+                );
+            if (! $expenseAccount) {
+                throw ValidationException::withMessages([
+                    'pay_account_id' => ['حساب مصروف الموظف غير صالح أو غير نشط.'],
+                ]);
+            }
+
+            $entry = $posting->post(
+                $lockedShift->restaurant_id,
+                'WG-',
+                $reference,
+                $workDate,
+                'أجر '.$employee->name.' - وردية #'.$lockedShift->id,
+                $request->user()->id,
+                [
+                    ['account_id' => $expenseAccount->id, 'debit' => $amount, 'description' => $employee->pay_type],
+                    ['account_id' => $paymentAccount->id, 'credit' => $amount, 'description' => 'دفع الأجر عبر '.$validated['payment_method']],
+                ],
+            );
+
+            $relation = $group ? $group->employees() : $lockedShift->employees();
+            if (! $group && ! $lockedShift->employees()->whereKey($employee->id)->exists()) {
+                $relation->attach($employee->id);
+            }
+            $relation->updateExistingPivot($employee->id, [
+                'payment_method' => $validated['payment_method'],
+                'paid_at' => now(),
+                'paid_amount' => $amount,
+                'journal_entry_id' => $entry->id,
+                'paid_by' => $request->user()->id,
+            ]);
+
+            return $entry;
+        });
+
+        return response()->json([
+            'journal_entry' => $entry,
+            'message' => 'تم دفع أجر الموظف وإنشاء القيد المحاسبي',
+        ]);
+    }
+
+    private function wageReference(Employee $employee, string $workDate, Shift $shift, ?ShiftGroup $group): string
+    {
+        return $employee->pay_type === 'daily'
+            ? 'WAGE-'.$employee->id.'-'.$workDate
+            : 'WAGE-'.$employee->id.'-'.($group ? 'GROUP-'.$group->id : $shift->id);
+    }
+
+    private function employeesForWages(Shift $shift, ?ShiftGroup $group)
+    {
+        $employees = $group
+            ? $group->employees()->with('user')->get()
+            : $shift->employees()->with('user')->get();
+
+        if (! $group && $shift->employee_id && ! $employees->contains('id', $shift->employee_id)) {
+            $employee = $shift->employee()->with('user')->first();
+            if ($employee) {
+                $employee->setRelation('pivot', (object) [
+                    'payment_method' => null,
+                    'paid_at' => null,
+                    'paid_amount' => null,
+                    'journal_entry_id' => null,
+                    'paid_by' => null,
+                ]);
+                $employees->push($employee);
+            }
+        }
+
+        return $employees;
+    }
+
+    private function wageRevenue(Shift $shift, ?ShiftGroup $group): float
+    {
+        $shiftIds = $group ? $group->shifts()->pluck('id') : collect([$shift->id]);
+        $orders = Order::whereIn('shift_id', $shiftIds)
+            ->where(function ($query) {
+                $query->where('payment_status', 'paid')->orWhere('status', 'completed');
+            })
+            ->get();
+        $payments = Payment::where('paymentable_type', Order::class)
+            ->whereIn('paymentable_id', $orders->pluck('id'))
+            ->get();
+
+        return (float) ($payments->isNotEmpty()
+            ? $payments->sum('amount')
+            : $orders->sum('total_amount'));
+    }
+
     private function userHasShiftPermission(User $user, string $permission): bool
     {
         return Permission::where('name', $permission)
@@ -712,27 +907,12 @@ class ShiftController extends Controller
         );
         if ($request->input('status') === 'closed') {
             abort_unless($request->user()->hasPermissionTo('close_shift', 'sanctum'), 403);
-            $hasOtherOpenShift = $shift->shift_group_id
-                ? Shift::where('shift_group_id', $shift->shift_group_id)
-                    ->where('status', 'open')
-                    ->where('id', '!=', $shift->id)
-                    ->exists()
-                : false;
-            $hasEmployees = $shift->group
-                ? $shift->group->employees()->exists()
-                : ($shift->employees()->exists() || $shift->employee_id);
-            if (! $hasOtherOpenShift && $hasEmployees) {
-                abort_unless($request->user()->hasPermissionTo('pay_employee_wages', 'sanctum'), 403);
-            }
         }
         $validated = $request->validate([
             'actual_cash' => 'sometimes|numeric|min:0',
             'status' => 'sometimes|in:open,closed',
             'notes' => 'sometimes|string',
             'end_time' => 'sometimes|date_format:H:i',
-            'employee_payments' => 'sometimes|array',
-            'employee_payments.*.employee_id' => 'required|integer|distinct',
-            'employee_payments.*.payment_method' => 'required|string|max:50',
         ]);
         $journalCreated = false;
         if ($request->has('status') && $request->status === 'closed') {
@@ -752,10 +932,6 @@ class ShiftController extends Controller
                         ->where('id', '!=', $lockedShift->id)
                         ->exists()
                     : false;
-                $groupEmployees = $group?->employees()->with('user')->get();
-                if ($groupEmployees && $groupEmployees->isNotEmpty() && ! $hasOtherOpenShift) {
-                    abort_unless($request->user()->hasPermissionTo('pay_employee_wages', 'sanctum'), 403);
-                }
                 $cashOrders = Order::where('restaurant_id', $shift->restaurant_id)
                     ->where('shift_id', $shift->id)
                     ->where(function ($q) {
@@ -847,109 +1023,6 @@ class ShiftController extends Controller
                     $journalCreated = true;
                 }
 
-                $employees = $group
-                    ? ($hasOtherOpenShift ? collect() : ($groupEmployees ?? collect()))
-                    : $lockedShift->employees()->with('user')->get();
-                $employeeIds = $employees->pluck('id')->map(fn ($id) => (int) $id)->all();
-                if (! $group && ! $employeeIds && $lockedShift->employee_id) {
-                    $employeeIds = [(int) $lockedShift->employee_id];
-                    $employees = Employee::whereIn('id', $employeeIds)->with('user')->get();
-                }
-                $employees = $employees
-                    ->where('restaurant_id', $restaurantId)
-                    ->where('status', 'active')
-                    ->whereIn('pay_type', ['daily', 'percentage'])
-                    ->where('pay_auto', true)
-                    ->values();
-                $employeePayments = collect($request->input('employee_payments', []))
-                    ->keyBy(fn ($item) => (int) $item['employee_id']);
-                if ($employees->count() !== count($employeeIds)
-                    || $employeePayments->count() !== $employees->count()
-                    || $employees->contains(fn ($item) => ! $employeePayments->has((int) $item->id))) {
-                    throw ValidationException::withMessages([
-                        'employee_payments' => ['حدد طريقة دفع أجر كل موظف مشارك في الوردية.'],
-                    ]);
-                }
-
-                foreach ($employees as $employee) {
-                    $method = $employeePayments->get((int) $employee->id)['payment_method'];
-                    if ($group) {
-                        $group->employees()->updateExistingPivot($employee->id, ['payment_method' => $method]);
-                    } elseif ($lockedShift->employees()->whereKey($employee->id)->exists()) {
-                        $lockedShift->employees()->updateExistingPivot($employee->id, ['payment_method' => $method]);
-                    }
-                    $wageRevenue = $totalRevenue;
-                    if ($group && $employee->pay_type === 'percentage') {
-                        $groupShiftIds = $group->shifts()->pluck('id');
-                        $groupOrders = Order::whereIn('shift_id', $groupShiftIds)
-                            ->where(function ($query) {
-                                $query->where('payment_status', 'paid')->orWhere('status', 'completed');
-                            })
-                            ->get();
-                        $groupPayments = Payment::where('paymentable_type', Order::class)
-                            ->whereIn('paymentable_id', $groupOrders->pluck('id'))
-                            ->get();
-                        $wageRevenue = $groupPayments->isNotEmpty()
-                            ? (float) $groupPayments->sum('amount')
-                            : (float) $groupOrders->sum('total_amount');
-                    }
-                    $amount = $employee->pay_type === 'daily'
-                        ? (float) $employee->pay_rate
-                        : $wageRevenue * ((float) $employee->pay_rate / 100);
-                    $amount = round($amount, 2);
-
-                    if ($amount > 0) {
-                        $expenseAccount = $employee->pay_account_id
-                            ? Account::where('id', $employee->pay_account_id)
-                                ->where('restaurant_id', $restaurantId)
-                                ->where('type', 'expense')
-                                ->where('is_active', true)
-                                ->first()
-                            : ($employee->user?->pay_account_id
-                                ? Account::where('id', $employee->user->pay_account_id)
-                                    ->where('restaurant_id', $restaurantId)
-                                    ->where('type', 'expense')
-                                    ->where('is_active', true)
-                                    ->first()
-                                : Account::firstOrCreate(
-                                    ['restaurant_id' => $restaurantId, 'code' => '5000'],
-                                    ['name' => 'رواتب وأجور', 'type' => 'expense', 'opening_balance' => 0, 'is_active' => true]
-                                ));
-                        if (! $expenseAccount) {
-                            throw ValidationException::withMessages([
-                                'pay_account_id' => ['حساب مصروف الموظف غير صالح أو غير نشط.'],
-                            ]);
-                        }
-
-                        $cashAccount = $posting->paymentAccount($restaurantId, $method);
-                        $workDate = Carbon::parse($shift->shift_date)->toDateString();
-                        $wageReference = $employee->pay_type === 'daily'
-                            ? 'WAGE-'.$employee->id.'-'.$workDate
-                            : 'WAGE-'.$employee->id.'-'.($group ? 'GROUP-'.$group->id : $shift->id);
-                        $alreadyPosted = JournalEntry::where('restaurant_id', $restaurantId)
-                            ->whereDate('entry_date', $workDate)
-                            ->where('reference', 'like', 'WAGE-'.$employee->id.'-%')
-                            ->exists();
-                        if ($employee->pay_type === 'daily' && $alreadyPosted) {
-                            $wageReference = null;
-                        }
-                        if ($wageReference !== null) {
-                            $posting->post(
-                                $restaurantId,
-                                'WG-',
-                                $wageReference,
-                                $workDate,
-                                'أجر '.$employee->name.' - وردية #'.$shift->id,
-                                $request->user()->id,
-                                [
-                                    ['account_id' => $expenseAccount->id, 'debit' => $amount, 'description' => $employee->pay_type],
-                                    ['account_id' => $cashAccount->id, 'credit' => $amount, 'description' => 'دفع الأجر عبر '.$method],
-                                ]
-                            );
-                            $journalCreated = true;
-                        }
-                    }
-                }
                 if (isset($validated['end_time']) && is_string($validated['end_time']) && strlen($validated['end_time']) === 5) {
                     $validated['end_time'] .= ':00';
                 }

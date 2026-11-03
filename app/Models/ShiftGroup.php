@@ -38,7 +38,7 @@ class ShiftGroup extends Model
     public function employees(): BelongsToMany
     {
         return $this->belongsToMany(Employee::class, 'shift_group_employees')
-            ->withPivot('payment_method')
+            ->withPivot('payment_method', 'paid_at', 'paid_amount', 'journal_entry_id', 'paid_by')
             ->withTimestamps();
     }
 }

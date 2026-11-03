@@ -6,8 +6,12 @@ use App\Models\Account;
 use App\Models\Employee;
 use App\Models\JournalEntry;
 use App\Models\JournalEntryLine;
+use App\Models\KitchenStation;
 use App\Models\Order;
+use App\Models\OrderItem;
+use App\Models\OrderKitchenStation;
 use App\Models\Payment;
+use App\Models\Product;
 use App\Models\Restaurant;
 use App\Models\Setting;
 use App\Models\Shift;
@@ -423,7 +427,7 @@ class CashierAccountingTest extends TestCase
         $this->assertEquals([1, 1], collect($response->json('shifts'))->pluck('orders_count')->all());
     }
 
-    public function test_closing_a_shift_posts_from_the_cashier_vault_to_payment_accounts_once(): void
+    public function test_employee_wages_are_paid_separately_and_shift_closing_posts_revenue_only(): void
     {
         $restaurant = $this->createRestaurant();
         $cashier = $this->createUser($restaurant);
@@ -529,20 +533,37 @@ class CashierAccountingTest extends TestCase
         }
 
         $this->actingAs($cashier, 'sanctum')
-            ->putJson('/api/shifts/'.$shift->id, ['status' => 'closed', 'actual_cash' => 100])
-            ->assertUnprocessable()
-            ->assertJsonValidationErrors('employee_payments');
-        $this->assertDatabaseMissing('journal_entries', ['reference' => 'SHIFT-'.$shift->id]);
+            ->getJson('/api/shifts/'.$shift->id.'/employee-wages')
+            ->assertOk()
+            ->assertJsonCount(2, 'employees');
 
         $this->actingAs($cashier, 'sanctum')
-            ->putJson('/api/shifts/'.$shift->id, [
-                'status' => 'closed',
-                'actual_cash' => 100,
-                'employee_payments' => [
-                    ['employee_id' => $employee->id, 'payment_method' => 'cash'],
-                    ['employee_id' => $commissionEmployee->id, 'payment_method' => 'fawry'],
-                ],
+            ->postJson('/api/shifts/'.$shift->id.'/employee-wages', [
+                'employee_id' => $employee->id,
+                'payment_method' => 'cash',
             ])
+            ->assertOk();
+        $this->actingAs($cashier, 'sanctum')
+            ->postJson('/api/shifts/'.$shift->id.'/employee-wages', [
+                'employee_id' => $employee->id,
+                'payment_method' => 'cash',
+            ])
+            ->assertUnprocessable()
+            ->assertJsonValidationErrors('employee_id');
+        $this->actingAs($cashier, 'sanctum')
+            ->postJson('/api/shifts/'.$shift->id.'/employee-wages', [
+                'employee_id' => $commissionEmployee->id,
+                'payment_method' => 'fawry',
+            ])
+            ->assertOk();
+
+        $this->actingAs($cashier, 'sanctum')
+            ->getJson('/api/shifts/'.$shift->id.'/employee-wages')
+            ->assertOk()
+            ->assertJsonCount(0, 'employees');
+
+        $this->actingAs($cashier, 'sanctum')
+            ->putJson('/api/shifts/'.$shift->id, ['status' => 'closed', 'actual_cash' => 100])
             ->assertOk();
 
         $entry = JournalEntry::where('reference', 'SHIFT-'.$shift->id)->firstOrFail();
@@ -569,15 +590,11 @@ class CashierAccountingTest extends TestCase
         $this->putJson('/api/shifts/'.$shift->id, [
             'status' => 'closed',
             'actual_cash' => 100,
-            'employee_payments' => [
-                ['employee_id' => $employee->id, 'payment_method' => 'cash'],
-                ['employee_id' => $commissionEmployee->id, 'payment_method' => 'fawry'],
-            ],
         ])->assertUnprocessable();
         $this->assertSame(1, JournalEntry::where('reference', 'SHIFT-'.$shift->id)->count());
     }
 
-    public function test_percentage_wage_uses_only_the_employee_assigned_to_the_closed_shift(): void
+    public function test_percentage_wage_uses_only_the_employee_assigned_to_the_shift(): void
     {
         $restaurant = $this->createRestaurant();
         $cashier = $this->createUser($restaurant);
@@ -663,12 +680,17 @@ class CashierAccountingTest extends TestCase
         ]);
 
         $this->actingAs($cashier, 'sanctum')
-            ->putJson('/api/shifts/'.$shift->id, [
-                'status' => 'closed',
-                'employee_payments' => [
-                    ['employee_id' => $employee->id, 'payment_method' => 'cash'],
-                ],
+            ->getJson('/api/shifts/'.$shift->id.'/employee-wages')
+            ->assertOk()
+            ->assertJsonPath('employees.0.amount', 50);
+        $this->actingAs($cashier, 'sanctum')
+            ->postJson('/api/shifts/'.$shift->id.'/employee-wages', [
+                'employee_id' => $employee->id,
+                'payment_method' => 'cash',
             ])
+            ->assertOk();
+        $this->actingAs($cashier, 'sanctum')
+            ->putJson('/api/shifts/'.$shift->id, ['status' => 'closed'])
             ->assertOk();
 
         $wageEntry = JournalEntry::where('reference', 'WAGE-'.$employee->id.'-'.$shift->id)->firstOrFail();
@@ -682,6 +704,152 @@ class CashierAccountingTest extends TestCase
             0,
             JournalEntry::where('reference', 'like', 'WAGE-'.$unassignedEmployee->id.'-%')->count()
         );
+    }
+
+    public function test_product_editors_can_assign_products_to_kitchen_stations(): void
+    {
+        $restaurant = $this->createRestaurant();
+        $user = $this->createUser($restaurant);
+        $this->grantPermissions($user, ['view_products', 'create_products']);
+        $station = KitchenStation::create([
+            'restaurant_id' => $restaurant->id,
+            'name' => 'Grill',
+            'display_name' => 'الشواء',
+            'is_active' => true,
+        ]);
+
+        $this->actingAs($user, 'sanctum')
+            ->getJson('/api/products/kitchen-stations')
+            ->assertOk()
+            ->assertJsonPath('stations.0.id', $station->id);
+
+        $response = $this->actingAs($user, 'sanctum')
+            ->postJson('/api/products', [
+                'name' => 'مشويات',
+                'sale_price' => 100,
+                'cost_price' => 50,
+                'kitchen_station_id' => $station->id,
+            ])
+            ->assertCreated();
+
+        $this->assertDatabaseHas('products', [
+            'id' => $response->json('data.id'),
+            'kitchen_station_id' => $station->id,
+        ]);
+    }
+
+    public function test_chef_user_requires_and_stores_a_kitchen_station(): void
+    {
+        $restaurant = $this->createRestaurant();
+        $admin = $this->createUser($restaurant);
+        $this->grantPermissions($admin, ['create_users']);
+        Role::create(['name' => 'Chef', 'guard_name' => 'sanctum']);
+        $station = KitchenStation::create([
+            'restaurant_id' => $restaurant->id,
+            'name' => 'Fry',
+            'display_name' => 'المقلي',
+            'is_active' => true,
+        ]);
+
+        $this->actingAs($admin, 'sanctum')
+            ->postJson('/api/admin/users', [
+                'name' => 'Chef User',
+                'username' => 'chef.user',
+                'password' => 'secret123',
+                'role' => 'Chef',
+            ])
+            ->assertUnprocessable()
+            ->assertJsonValidationErrors('kitchen_station_id');
+
+        $response = $this->actingAs($admin, 'sanctum')
+            ->postJson('/api/admin/users', [
+                'name' => 'Chef User',
+                'username' => 'chef.user',
+                'password' => 'secret123',
+                'role' => 'Chef',
+                'kitchen_station_id' => $station->id,
+            ])
+            ->assertCreated();
+
+        $this->assertSame($station->id, $response->json('user.kitchen_station_id'));
+    }
+
+    public function test_station_kitchen_users_only_see_their_items_and_cannot_serve_unready_orders(): void
+    {
+        $restaurant = $this->createRestaurant();
+        $chef = $this->createUser($restaurant);
+        $this->grantPermissions($chef, ['view_station_kitchen_orders', 'update_kitchen_order']);
+        $station = KitchenStation::create([
+            'restaurant_id' => $restaurant->id,
+            'name' => 'Grill',
+            'display_name' => 'الشواء',
+            'is_active' => true,
+        ]);
+        $otherStation = KitchenStation::create([
+            'restaurant_id' => $restaurant->id,
+            'name' => 'Drinks',
+            'display_name' => 'المشروبات',
+            'is_active' => true,
+        ]);
+        $chef->update(['kitchen_station_id' => $station->id]);
+
+        $makeOrder = function (string $number, array $stations) use ($restaurant, $chef): Order {
+            $order = Order::create([
+                'restaurant_id' => $restaurant->id,
+                'cashier_id' => $chef->id,
+                'order_number' => $number,
+                'type' => 'takeaway',
+                'status' => 'preparing',
+                'payment_status' => 'unpaid',
+                'payment_method' => 'cash',
+                'subtotal' => 100,
+                'total_amount' => 100,
+                'amount_paid' => 0,
+            ]);
+            foreach ($stations as $index => $station) {
+                $product = Product::create([
+                    'restaurant_id' => $restaurant->id,
+                    'name' => $number.'-'.$index,
+                    'slug' => Str::slug($number.'-'.$index),
+                    'sale_price' => 100,
+                    'cost_price' => 50,
+                ]);
+                $item = OrderItem::create([
+                    'order_id' => $order->id,
+                    'product_id' => $product->id,
+                    'quantity' => 1,
+                    'unit_price' => 100,
+                    'total_price' => 100,
+                    'kitchen_status' => 'preparing',
+                ]);
+                OrderKitchenStation::create([
+                    'order_item_id' => $item->id,
+                    'station_id' => $station->id,
+                ]);
+            }
+
+            return $order;
+        };
+        $order = $makeOrder('STATION-ORDER-1', [$station, $otherStation]);
+        $makeOrder('STATION-ORDER-2', [$otherStation]);
+        $stationItem = $order->items()->firstOrFail();
+
+        $this->actingAs($chef, 'sanctum')
+            ->getJson('/api/kitchen/orders')
+            ->assertOk()
+            ->assertJsonCount(1, 'orders')
+            ->assertJsonCount(1, 'orders.0.items')
+            ->assertJsonPath('orders.0.can_mark_served', false);
+
+        $this->actingAs($chef, 'sanctum')
+            ->postJson('/api/kitchen/order-items/'.$stationItem->id.'/status', [
+                'kitchen_status' => 'ready',
+                'station_id' => $station->id,
+            ])
+            ->assertOk();
+        $this->actingAs($chef, 'sanctum')
+            ->postJson('/api/orders/'.$order->id.'/status', ['status' => 'served'])
+            ->assertStatus(422);
     }
 
     private function createRestaurant(): Restaurant

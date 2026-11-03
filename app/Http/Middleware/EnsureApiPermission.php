@@ -46,7 +46,9 @@ class EnsureApiPermission
         }
 
         if ($resource === 'kitchen') {
-            return $read ? 'view_kitchen' : 'update_kitchen_order';
+            return $read
+                ? ['view_kitchen', 'view_all_kitchen_orders', 'view_station_kitchen_orders']
+                : 'update_kitchen_order';
         }
 
         if ($resource === 'attendances') {

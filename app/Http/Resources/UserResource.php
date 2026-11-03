@@ -20,6 +20,11 @@ class UserResource extends JsonResource
             'is_active' => (bool) $this->is_active,
             'vault_account_id' => $this->vault_account_id,
             'pay_account_id' => $this->pay_account_id,
+            'kitchen_station_id' => $this->kitchen_station_id,
+            'kitchen_station' => $this->whenLoaded('kitchenStation', fn () => $this->kitchenStation ? [
+                'id' => $this->kitchenStation->id,
+                'name' => $this->kitchenStation->display_name ?: $this->kitchenStation->name,
+            ] : null),
             'vault_account' => $this->whenLoaded('vaultAccount', fn () => $this->vaultAccount ? [
                 'id' => $this->vaultAccount->id,
                 'code' => $this->vaultAccount->code,

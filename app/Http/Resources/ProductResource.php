@@ -34,6 +34,12 @@ class ProductResource extends JsonResource
                 'name' => $this->category->name,
                 'color' => $this->category->color,
             ] : null),
+            'kitchen_station_id' => $this->kitchen_station_id,
+            'kitchen_station' => $this->whenLoaded('kitchenStation', fn() => $this->kitchenStation ? [
+                'id' => $this->kitchenStation->id,
+                'name' => $this->kitchenStation->display_name ?: $this->kitchenStation->name,
+                'color' => $this->kitchenStation->color,
+            ] : null),
             'sizes' => $this->whenLoaded('sizes', fn() => $this->sizes->map(fn($s) => [
                 'id' => $s->id,
                 'name' => $s->name,

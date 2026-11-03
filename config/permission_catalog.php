@@ -39,6 +39,8 @@ return [
         'edit_tables' => 'تعديل الطاولات وتفريغها',
         'delete_tables' => 'حذف الطاولات',
         'view_kitchen' => 'عرض شاشة المطبخ',
+        'view_all_kitchen_orders' => 'عرض جميع طلبات المطبخ',
+        'view_station_kitchen_orders' => 'عرض طلبات محطة المستخدم فقط',
         'update_kitchen_order' => 'تحديث حالة طلبات المطبخ',
     ],
     'المخزون والمشتريات والموردون' => [

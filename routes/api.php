@@ -64,6 +64,7 @@ Route::middleware(['auth:sanctum', 'audit', 'api.permission:categories'])->get('
 
 // Products
 Route::middleware(['auth:sanctum', 'audit', 'api.permission:products'])->get('products/available', [\App\Http\Controllers\API\ProductController::class, 'available']);
+Route::middleware(['auth:sanctum', 'audit', 'api.permission:products'])->get('products/kitchen-stations', [\App\Http\Controllers\API\KitchenController::class, 'stationsForAssignment']);
 Route::middleware(['auth:sanctum', 'audit', 'api.permission:products'])->apiResource('products', \App\Http\Controllers\API\ProductController::class);
 Route::middleware(['auth:sanctum', 'audit', 'api.permission:products'])->get('products/{product}/sizes', [\App\Http\Controllers\API\ProductController::class, 'sizes']);
 Route::middleware(['auth:sanctum', 'audit', 'api.permission:products'])->get('products/{product}/modifiers', [\App\Http\Controllers\API\ProductController::class, 'modifiers']);
@@ -118,6 +119,8 @@ Route::middleware(['auth:sanctum', 'audit', 'api.permission:attendances'])->apiR
 Route::middleware(['auth:sanctum', 'audit'])->get('shifts/options', [\App\Http\Controllers\API\ShiftController::class, 'options']);
 Route::middleware(['auth:sanctum', 'audit'])->get('shifts/current', [\App\Http\Controllers\API\ShiftController::class, 'current']);
 Route::middleware(['auth:sanctum', 'audit'])->post('shifts/open', [\App\Http\Controllers\API\ShiftController::class, 'store']);
+Route::middleware(['auth:sanctum', 'audit'])->get('shifts/{shift}/employee-wages', [\App\Http\Controllers\API\ShiftController::class, 'employeeWages']);
+Route::middleware(['auth:sanctum', 'audit'])->post('shifts/{shift}/employee-wages', [\App\Http\Controllers\API\ShiftController::class, 'payEmployeeWage']);
 Route::middleware(['auth:sanctum', 'audit'])->get('shifts/{shift}/revenue', [\App\Http\Controllers\API\ShiftController::class, 'revenue']);
 Route::middleware(['auth:sanctum', 'audit'])->apiResource('shifts', \App\Http\Controllers\API\ShiftController::class);
 
@@ -152,6 +155,7 @@ Route::middleware(['auth:sanctum', 'audit', 'api.permission:notifications'])->pr
 // Users & Roles & Permissions (admin only)
 Route::middleware(['auth:sanctum', 'audit'])->prefix('admin')->group(function () {
     Route::middleware('api.permission:users')->apiResource('users', \App\Http\Controllers\API\UserController::class);
+    Route::middleware('api.permission:users')->get('kitchen-stations', [\App\Http\Controllers\API\KitchenController::class, 'stationsForAssignment']);
     Route::middleware('api.permission:roles')->apiResource('roles', \App\Http\Controllers\API\RoleController::class);
     Route::middleware('api.permission:roles')->apiResource('permissions', \App\Http\Controllers\API\PermissionController::class);
 });

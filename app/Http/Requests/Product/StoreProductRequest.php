@@ -3,6 +3,7 @@
 namespace App\Http\Requests\Product;
 
 use Illuminate\Foundation\Http\FormRequest;
+use Illuminate\Validation\Rule;
 
 class StoreProductRequest extends FormRequest
 {
@@ -15,6 +16,13 @@ class StoreProductRequest extends FormRequest
     {
         return [
             'category_id' => 'nullable|exists:categories,id',
+            'kitchen_station_id' => [
+                'nullable',
+                'integer',
+                Rule::exists('kitchen_stations', 'id')->where(fn ($query) => $query
+                    ->where('restaurant_id', $this->user()->restaurant_id)
+                    ->where('is_active', true)),
+            ],
             'name' => 'required|string|max:255',
             'slug' => 'nullable|string|max:255|unique:products,slug',
             'sku' => 'nullable|string|max:100|unique:products,sku',
