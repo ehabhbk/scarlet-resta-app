@@ -14,9 +14,32 @@ class JournalEntryController extends Controller
     {
         $restaurantId = $request->user()->restaurant_id;
         $query = JournalEntry::where('restaurant_id', $restaurantId)->with('lines.account', 'creator');
-        if ($request->has('from')) $query->where('entry_date', '>=', $request->from);
-        if ($request->has('to')) $query->where('entry_date', '<=', $request->to);
-        return response()->json($query->orderByDesc('entry_date')->orderByDesc('id')->paginate(15));
+
+        if ($request->filled('from')) {
+            $query->where('entry_date', '>=', $request->input('from'));
+        }
+        if ($request->filled('to')) {
+            $query->where('entry_date', '<=', $request->input('to'));
+        }
+        if ($request->filled('entry_number')) {
+            $query->where('entry_number', 'like', '%'.$request->input('entry_number').'%');
+        }
+        if ($request->filled('search')) {
+            $search = '%'.trim((string) $request->input('search')).'%';
+            $query->where(function ($q) use ($search) {
+                $q->where('entry_number', 'like', $search)
+                    ->orWhere('reference', 'like', $search)
+                    ->orWhere('description', 'like', $search);
+            });
+        }
+
+        $perPage = min(max($request->integer('per_page', 50), 1), 200);
+
+        return response()->json(
+            $query->orderByDesc('entry_date')
+                ->orderByDesc('id')
+                ->paginate($perPage)
+        );
     }
 
     public function store(Request $request)
@@ -52,10 +75,10 @@ class JournalEntryController extends Controller
         }
 
         $entry = DB::transaction(function () use ($validated, $request, $restaurantId) {
-            $lastNumber = JournalEntry::where('restaurant_id', $restaurantId)->max('id') ?? 0;
+            DB::table('restaurants')->where('id', $restaurantId)->lockForUpdate()->first();
             $entry = JournalEntry::create([
                 'restaurant_id' => $restaurantId,
-                'entry_number' => 'JE-' . str_pad((string) ($lastNumber + 1), 6, '0', STR_PAD_LEFT),
+                'entry_number' => JournalEntry::nextEntryNumber($restaurantId),
                 'entry_date' => $validated['entry_date'],
                 'reference' => $validated['reference'] ?? null,
                 'description' => $validated['description'] ?? null,
@@ -75,15 +98,15 @@ class JournalEntryController extends Controller
         return response()->json(['entry' => $entry->load('lines.account', 'creator'), 'message' => 'تم إنشاء قيد اليومية'], 201);
     }
 
-    public function show(JournalEntry $entry)
+    public function show(JournalEntry $journalEntry)
     {
-        if ($entry->restaurant_id !== auth()->user()->restaurant_id) abort(403);
-        return response()->json(['entry' => $entry->load('lines.account', 'creator')]);
+        if ($journalEntry->restaurant_id !== auth()->user()->restaurant_id) abort(403);
+        return response()->json(['entry' => $journalEntry->load('lines.account', 'creator')]);
     }
 
-    public function update(Request $request, JournalEntry $entry)
+    public function update(Request $request, JournalEntry $journalEntry)
     {
-        if ($entry->restaurant_id !== auth()->user()->restaurant_id) abort(403);
+        if ($journalEntry->restaurant_id !== auth()->user()->restaurant_id) abort(403);
         $validated = $request->validate([
             'entry_date' => 'sometimes|date',
             'reference' => 'nullable|string|max:100',
@@ -112,12 +135,12 @@ class JournalEntryController extends Controller
             }
         }
 
-        DB::transaction(function () use ($entry, $validated, $request) {
-            $entry->update(collect($validated)->except('lines')->all());
+        DB::transaction(function () use ($journalEntry, $validated, $request) {
+            $journalEntry->update(collect($validated)->except('lines')->all());
             if (isset($validated['lines'])) {
-                $entry->lines()->delete();
+                $journalEntry->lines()->delete();
                 foreach ($validated['lines'] as $line) {
-                    $entry->lines()->create([
+                    $journalEntry->lines()->create([
                         'account_id' => $line['account_id'],
                         'debit' => (float) ($line['debit'] ?? 0),
                         'credit' => (float) ($line['credit'] ?? 0),
@@ -127,13 +150,13 @@ class JournalEntryController extends Controller
             }
         });
 
-        return response()->json(['entry' => $entry->fresh()->load('lines.account', 'creator'), 'message' => 'تم تحديث قيد اليومية']);
+        return response()->json(['entry' => $journalEntry->fresh()->load('lines.account', 'creator'), 'message' => 'تم تحديث قيد اليومية']);
     }
 
-    public function destroy(JournalEntry $entry)
+    public function destroy(JournalEntry $journalEntry)
     {
-        if ($entry->restaurant_id !== auth()->user()->restaurant_id) abort(403);
-        $entry->delete();
+        if ($journalEntry->restaurant_id !== auth()->user()->restaurant_id) abort(403);
+        $journalEntry->delete();
         return response()->json(['message' => 'تم حذف قيد اليومية']);
     }
 }

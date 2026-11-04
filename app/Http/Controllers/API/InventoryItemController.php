@@ -81,18 +81,18 @@ class InventoryItemController extends Controller
         return response()->json(['item' => $item->load('unit', 'supplier'), 'message' => 'تم إضافة الصنف'], 201);
     }
 
-    public function show(InventoryItem $item)
+    public function show(InventoryItem $inventoryItem)
     {
-        if ($item->restaurant_id !== auth()->user()->restaurant_id) {
+        if ($inventoryItem->restaurant_id !== auth()->user()->restaurant_id) {
             abort(403);
         }
 
-        return response()->json(['item' => $item->load('unit', 'supplier')]);
+        return response()->json(['item' => $inventoryItem->load('unit', 'supplier')]);
     }
 
-    public function update(Request $request, InventoryItem $item)
+    public function update(Request $request, InventoryItem $inventoryItem)
     {
-        if ($item->restaurant_id !== auth()->user()->restaurant_id) {
+        if ($inventoryItem->restaurant_id !== auth()->user()->restaurant_id) {
             abort(403);
         }
         $validated = $request->validate([
@@ -102,17 +102,17 @@ class InventoryItemController extends Controller
             'cost_per_unit' => 'sometimes|numeric|min:0',
             'is_active' => 'sometimes|boolean',
         ]);
-        $item->update($validated);
+        $inventoryItem->update($validated);
 
-        return response()->json(['item' => $item->fresh(), 'message' => 'تم تحديث الصنف']);
+        return response()->json(['item' => $inventoryItem->fresh(), 'message' => 'تم تحديث الصنف']);
     }
 
-    public function destroy(InventoryItem $item)
+    public function destroy(InventoryItem $inventoryItem)
     {
-        if ($item->restaurant_id !== auth()->user()->restaurant_id) {
+        if ($inventoryItem->restaurant_id !== auth()->user()->restaurant_id) {
             abort(403);
         }
-        $item->delete();
+        $inventoryItem->delete();
 
         return response()->json(['message' => 'تم حذف الصنف']);
     }
@@ -533,21 +533,21 @@ class StockMovementController extends Controller
         });
     }
 
-    public function show(StockMovement $movement)
+    public function show(StockMovement $stockMovement)
     {
-        if ($movement->restaurant_id !== auth()->user()->restaurant_id) {
+        if ($stockMovement->restaurant_id !== auth()->user()->restaurant_id) {
             abort(403);
         }
 
-        return response()->json(['movement' => $movement->load('inventoryItem', 'user')]);
+        return response()->json(['movement' => $stockMovement->load('inventoryItem', 'user')]);
     }
 
-    public function destroy(StockMovement $movement)
+    public function destroy(StockMovement $stockMovement)
     {
-        if ($movement->restaurant_id !== auth()->user()->restaurant_id) {
+        if ($stockMovement->restaurant_id !== auth()->user()->restaurant_id) {
             abort(403);
         }
-        $movement->delete();
+        $stockMovement->delete();
 
         return response()->json(['message' => 'تم حذف الحركة']);
     }

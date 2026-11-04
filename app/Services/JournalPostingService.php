@@ -145,25 +145,28 @@ class JournalPostingService
             ]);
         }
 
-        $lastNumber = DB::table('journal_entries')->where('restaurant_id', $restaurantId)->max('id') ?? 0;
-        $entry = JournalEntry::create([
-            'restaurant_id' => $restaurantId,
-            'entry_number' => $numberPrefix.str_pad((string) ($lastNumber + 1), 6, '0', STR_PAD_LEFT),
-            'entry_date' => $date,
-            'reference' => $reference,
-            'description' => $description,
-            'created_by' => $userId,
-        ]);
+        return DB::transaction(function () use ($restaurantId, $reference, $date, $description, $userId, $lines) {
+            DB::table('restaurants')->where('id', $restaurantId)->lockForUpdate()->first();
 
-        foreach ($lines as $line) {
-            $entry->lines()->create([
-                'account_id' => $line['account_id'],
-                'debit' => round((float) ($line['debit'] ?? 0), 2),
-                'credit' => round((float) ($line['credit'] ?? 0), 2),
-                'description' => $line['description'] ?? null,
+            $entry = JournalEntry::create([
+                'restaurant_id' => $restaurantId,
+                'entry_number' => JournalEntry::nextEntryNumber($restaurantId),
+                'entry_date' => $date,
+                'reference' => $reference,
+                'description' => $description,
+                'created_by' => $userId,
             ]);
-        }
 
-        return $entry->load('lines.account');
+            foreach ($lines as $line) {
+                $entry->lines()->create([
+                    'account_id' => $line['account_id'],
+                    'debit' => round((float) ($line['debit'] ?? 0), 2),
+                    'credit' => round((float) ($line['credit'] ?? 0), 2),
+                    'description' => $line['description'] ?? null,
+                ]);
+            }
+
+            return $entry->load('lines.account');
+        });
     }
 }

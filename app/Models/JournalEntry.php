@@ -25,6 +25,24 @@ class JournalEntry extends Model
         'entry_date' => 'date',
     ];
 
+    /**
+     * Generate the next sequential journal entry number for a restaurant.
+     *
+     * Numbers are numeric and zero-padded to two digits (01, 02, ... 100).
+     * Callers must lock the restaurant row inside a transaction so two
+     * concurrent postings cannot receive the same number.
+     */
+    public static function nextEntryNumber(int $restaurantId): string
+    {
+        $maxNumber = (int) static::withTrashed()
+            ->where('restaurant_id', $restaurantId)
+            ->whereRaw("entry_number REGEXP '^[0-9]+$'")
+            ->selectRaw('MAX(CAST(entry_number AS UNSIGNED)) AS max_number')
+            ->value('max_number');
+
+        return str_pad((string) ($maxNumber + 1), 2, '0', STR_PAD_LEFT);
+    }
+
     public function restaurant(): BelongsTo
     {
         return $this->belongsTo(Restaurant::class);

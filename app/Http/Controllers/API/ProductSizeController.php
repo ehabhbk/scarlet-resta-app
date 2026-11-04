@@ -144,9 +144,9 @@ class InventoryUnitController extends Controller
         return response()->json(['unit' => $unit, 'message' => 'تم إضافة وحدة القياس'], 201);
     }
 
-    public function update(Request $request, \App\Models\InventoryUnit $unit)
+    public function update(Request $request, \App\Models\InventoryUnit $inventoryUnit)
     {
-        if ($unit->restaurant_id !== auth()->user()->restaurant_id) {
+        if ($inventoryUnit->restaurant_id !== auth()->user()->restaurant_id) {
             abort(403);
         }
         $validated = $request->validate([
@@ -154,16 +154,16 @@ class InventoryUnitController extends Controller
             'abbreviation' => 'sometimes|string|max:20',
             'is_active' => 'sometimes|boolean',
         ]);
-        $unit->update($validated);
-        return response()->json(['unit' => $unit->fresh(), 'message' => 'تم تحديث الوحدة']);
+        $inventoryUnit->update($validated);
+        return response()->json(['unit' => $inventoryUnit->fresh(), 'message' => 'تم تحديث الوحدة']);
     }
 
-    public function destroy(\App\Models\InventoryUnit $unit)
+    public function destroy(\App\Models\InventoryUnit $inventoryUnit)
     {
-        if ($unit->restaurant_id !== auth()->user()->restaurant_id) {
+        if ($inventoryUnit->restaurant_id !== auth()->user()->restaurant_id) {
             abort(403);
         }
-        $unit->delete();
+        $inventoryUnit->delete();
         return response()->json(['message' => 'تم حذف الوحدة']);
     }
 }
