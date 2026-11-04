@@ -214,7 +214,7 @@ class CashierAccountingTest extends TestCase
             ->assertJsonPath('permissions.2.label', 'عرض نقطة البيع والإيرادات');
     }
 
-    public function test_pos_revenue_is_visible_only_with_permission_and_orders_do_not_require_a_shift(): void
+    public function test_pos_revenue_is_hidden_when_the_cashier_has_no_open_shift(): void
     {
         $restaurant = $this->createRestaurant();
         $sellerWithRevenueAccess = $this->createUser($restaurant);
@@ -225,8 +225,8 @@ class CashierAccountingTest extends TestCase
             ->getJson('/api/shifts/current')
             ->assertOk()
             ->assertJsonPath('shift', null)
-            ->assertJsonPath('revenue.total', 250)
-            ->assertJsonPath('orders_count', 1);
+            ->assertJsonPath('revenue', null)
+            ->assertJsonPath('orders_count', null);
 
         $sellerWithoutRevenueAccess = $this->createUser($restaurant);
         $this->grantPermissions($sellerWithoutRevenueAccess, ['create_orders']);
@@ -433,7 +433,7 @@ class CashierAccountingTest extends TestCase
         $cashier = $this->createUser($restaurant);
         $cashierRole = Role::create(['name' => 'Cashier', 'guard_name' => 'sanctum']);
         $cashier->assignRole($cashierRole);
-        $this->grantPermissions($cashier, ['close_shift', 'pay_employee_wages']);
+        $this->grantPermissions($cashier, ['close_shift', 'pay_employee_wages', 'view_pos']);
         app(CashierAccountService::class)->ensureFor($cashier);
 
         $cashAccount = Account::create([
@@ -538,6 +538,20 @@ class CashierAccountingTest extends TestCase
             ->assertJsonCount(2, 'employees');
 
         $this->actingAs($cashier, 'sanctum')
+            ->putJson('/api/shifts/'.$shift->id, ['status' => 'closed'])
+            ->assertUnprocessable()
+            ->assertJsonPath(
+                'message',
+                'لا يمكن إغلاق الوردية قبل تسوية أجور الموظفين. الموظفون الذين لم تُسوى أجورهم: '
+                    .$cashier->name.'، موظف عمولة'
+            )
+            ->assertJsonPath(
+                'errors.status.0',
+                'لا يمكن إغلاق الوردية قبل تسوية أجور الموظفين. الموظفون الذين لم تُسوى أجورهم: '
+                    .$cashier->name.'، موظف عمولة'
+            );
+
+        $this->actingAs($cashier, 'sanctum')
             ->postJson('/api/shifts/'.$shift->id.'/employee-wages', [
                 'employee_id' => $employee->id,
                 'payment_method' => 'cash',
@@ -564,7 +578,16 @@ class CashierAccountingTest extends TestCase
 
         $this->actingAs($cashier, 'sanctum')
             ->putJson('/api/shifts/'.$shift->id, ['status' => 'closed', 'actual_cash' => 100])
-            ->assertOk();
+            ->assertOk()
+            ->assertJsonPath('shift.status', 'closed')
+            ->assertJsonPath('message', 'تم إغلاق الوردية وإنشاء قيود الوردية بنجاح');
+
+        $this->actingAs($cashier, 'sanctum')
+            ->getJson('/api/shifts/current')
+            ->assertOk()
+            ->assertJsonPath('shift', null)
+            ->assertJsonPath('revenue', null)
+            ->assertJsonPath('orders_count', null);
 
         $entry = JournalEntry::where('reference', 'SHIFT-'.$shift->id)->firstOrFail();
         $lines = JournalEntryLine::where('journal_entry_id', $entry->id)->get();
@@ -592,6 +615,49 @@ class CashierAccountingTest extends TestCase
             'actual_cash' => 100,
         ])->assertUnprocessable();
         $this->assertSame(1, JournalEntry::where('reference', 'SHIFT-'.$shift->id)->count());
+    }
+
+    public function test_shifts_without_wage_obligations_close_and_finish_the_group(): void
+    {
+        $restaurant = $this->createRestaurant();
+        $cashier = $this->createUser($restaurant);
+        $this->grantPermissions($cashier, ['open_shift', 'close_shift']);
+        $group = ShiftGroup::create([
+            'restaurant_id' => $restaurant->id,
+            'opened_by' => $cashier->id,
+            'name' => 'وردية تجريبية',
+            'shift_date' => now()->toDateString(),
+            'status' => 'open',
+        ]);
+        $shift = Shift::create([
+            'restaurant_id' => $restaurant->id,
+            'shift_group_id' => $group->id,
+            'user_id' => $cashier->id,
+            'name' => 'وردية بدون موظفين بأجر تلقائي',
+            'shift_date' => now()->toDateString(),
+            'start_time' => '08:00:00',
+            'end_time' => '23:59:00',
+            'status' => 'open',
+            'opening_cash' => 0,
+            'expected_cash' => 0,
+            'actual_cash' => 0,
+            'difference' => 0,
+        ]);
+
+        $this->actingAs($cashier, 'sanctum')
+            ->putJson('/api/shifts/'.$shift->id, ['status' => 'closed'])
+            ->assertOk()
+            ->assertJsonPath('shift.status', 'closed')
+            ->assertJsonPath('message', 'تم إغلاق الوردية بنجاح');
+
+        $this->assertDatabaseHas('shift_groups', ['id' => $group->id, 'status' => 'closed']);
+        $this->postJson('/api/shifts/open', [
+            'name' => 'الوردية التالية',
+            'shift_date' => now()->toDateString(),
+            'start_time' => '09:00',
+        ])->assertCreated()
+            ->assertJsonPath('group.status', 'open');
+        $this->assertDatabaseCount('shift_groups', 2);
     }
 
     public function test_percentage_wage_uses_only_the_employee_assigned_to_the_shift(): void

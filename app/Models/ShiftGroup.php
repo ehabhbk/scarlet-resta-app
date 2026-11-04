@@ -14,6 +14,7 @@ class ShiftGroup extends Model
         'opened_by',
         'name',
         'shift_date',
+        'status',
     ];
 
     protected $casts = [

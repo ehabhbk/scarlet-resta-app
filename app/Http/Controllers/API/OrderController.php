@@ -21,6 +21,7 @@ use App\Models\StockMovement;
 use App\Models\Table;
 use App\Services\JournalPostingService;
 use Carbon\Carbon;
+use Illuminate\Http\Exceptions\HttpResponseException;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 
@@ -96,6 +97,21 @@ class OrderController extends Controller
             ->assertConfiguredPaymentMethod($restaurantId, $validated['payment_method']);
 
         return DB::transaction(function () use ($validated, $user, $restaurantId) {
+            $currentShift = Shift::where('restaurant_id', $restaurantId)
+                ->where('user_id', $user->id)
+                ->where('status', 'open')
+                ->latest('id')
+                ->lockForUpdate()
+                ->first();
+
+            if (! $currentShift) {
+                $message = 'لا يمكن إنشاء طلب قبل فتح وردية جديدة.';
+                throw new HttpResponseException(response()->json([
+                    'message' => $message,
+                    'errors' => ['shift' => [$message]],
+                ], 422));
+            }
+
             $orderNumber = $this->nextOrderNumber();
 
             $subtotal = 0;
@@ -147,13 +163,6 @@ class OrderController extends Controller
                 }
                 $customerId = $customer->id;
             }
-
-            // Attach the sale to the cashier's currently open shift (if any).
-            $currentShift = Shift::where('restaurant_id', $restaurantId)
-                ->where('user_id', $user->id)
-                ->where('status', 'open')
-                ->latest('id')
-                ->first();
 
             $order = Order::create([
                 'restaurant_id' => $restaurantId,

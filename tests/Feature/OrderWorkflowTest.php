@@ -226,6 +226,23 @@ class OrderWorkflowTest extends TestCase
         ]);
     }
 
+    public function test_orders_cannot_be_created_without_an_open_shift(): void
+    {
+        $product = $this->createProduct('Tea', 10);
+
+        $this->postJson('/api/orders', [
+            'type' => 'takeaway',
+            'payment_method' => 'cash',
+            'items' => [
+                ['product_id' => $product->id, 'quantity' => 1],
+            ],
+        ])->assertUnprocessable()
+            ->assertJsonPath('message', 'لا يمكن إنشاء طلب قبل فتح وردية جديدة.')
+            ->assertJsonValidationErrors('shift');
+
+        $this->assertDatabaseCount('orders', 0);
+    }
+
     public function test_kitchen_item_can_be_marked_ready_using_status_payload(): void
     {
         $shift = $this->createShift();

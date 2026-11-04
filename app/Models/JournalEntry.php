@@ -7,6 +7,7 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\SoftDeletes;
+use Illuminate\Support\Facades\DB;
 
 class JournalEntry extends Model
 {
@@ -34,11 +35,16 @@ class JournalEntry extends Model
      */
     public static function nextEntryNumber(int $restaurantId): string
     {
-        $maxNumber = (int) static::withTrashed()
-            ->where('restaurant_id', $restaurantId)
-            ->whereRaw("entry_number REGEXP '^[0-9]+$'")
-            ->selectRaw('MAX(CAST(entry_number AS UNSIGNED)) AS max_number')
-            ->value('max_number');
+        $query = static::withTrashed()->where('restaurant_id', $restaurantId);
+        if (DB::connection()->getDriverName() === 'sqlite') {
+            $query->where('entry_number', '<>', '')
+                ->whereRaw("entry_number NOT GLOB '*[^0-9]*'")
+                ->selectRaw('MAX(CAST(entry_number AS INTEGER)) AS max_number');
+        } else {
+            $query->whereRaw("entry_number REGEXP '^[0-9]+$'")
+                ->selectRaw('MAX(CAST(entry_number AS UNSIGNED)) AS max_number');
+        }
+        $maxNumber = (int) $query->value('max_number');
 
         return str_pad((string) ($maxNumber + 1), 2, '0', STR_PAD_LEFT);
     }
@@ -58,4 +64,3 @@ class JournalEntry extends Model
         return $this->hasMany(JournalEntryLine::class);
     }
 }
-

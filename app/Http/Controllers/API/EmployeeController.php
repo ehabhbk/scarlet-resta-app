@@ -16,6 +16,7 @@ use App\Models\User;
 use App\Services\CashierAccountService;
 use App\Services\JournalPostingService;
 use Carbon\Carbon;
+use Illuminate\Http\Exceptions\HttpResponseException;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\Rule;
@@ -326,7 +327,7 @@ class AttendanceController extends Controller
     }
 }
 
-class ShiftController extends Controller
+class ShiftWorkflowController extends Controller
 {
     public function index(Request $request)
     {
@@ -421,7 +422,7 @@ class ShiftController extends Controller
                     'journal_entry_id' => $employee->pivot->journal_entry_id ?: $existingEntry?->id,
                 ];
             })
-            ->filter(fn (array $wage) => ! $wage['paid_at'])
+            ->filter(fn (array $wage) => ! $wage['paid_at'] && $wage['amount'] > 0)
             ->values();
 
         return response()->json(['employees' => $wages]);
@@ -636,44 +637,10 @@ class ShiftController extends Controller
         }
 
         if (! $shift) {
-            if (! $user->hasPermissionTo('view_pos', 'sanctum')) {
-                return response()->json([
-                    'shift' => null,
-                    'revenue' => null,
-                    'orders_count' => null,
-                ]);
-            }
-
-            $orders = Order::where('restaurant_id', $restaurantId)
-                ->where('cashier_id', $user->id)
-                ->whereDate('created_at', Carbon::today())
-                ->where(function ($query) {
-                    $query->where('payment_status', 'paid')->orWhere('status', 'completed');
-                })
-                ->get();
-            $orderIds = $orders->pluck('id');
-            $payments = Payment::where('paymentable_type', Order::class)
-                ->whereIn('paymentable_id', $orderIds)
-                ->get();
-            $byPayment = [];
-            foreach ($payments as $payment) {
-                $method = $payment->method ?: 'cash';
-                $byPayment[$method] = ($byPayment[$method] ?? 0) + (float) $payment->amount;
-            }
-            if (empty($byPayment)) {
-                foreach ($orders as $order) {
-                    $method = $order->payment_method ?: 'cash';
-                    $byPayment[$method] = ($byPayment[$method] ?? 0) + (float) $order->total_amount;
-                }
-            }
-
             return response()->json([
                 'shift' => null,
-                'revenue' => [
-                    'total' => round($orders->sum(fn ($order) => (float) $order->total_amount), 4),
-                    'by_payment_method' => array_map(fn ($amount) => round($amount, 4), $byPayment),
-                ],
-                'orders_count' => $orders->count(),
+                'revenue' => null,
+                'orders_count' => null,
             ]);
         }
 
@@ -1000,6 +967,40 @@ class ShiftController extends Controller
                 $group = $lockedShift->shift_group_id
                     ? ShiftGroup::whereKey($lockedShift->shift_group_id)->lockForUpdate()->first()
                     : null;
+
+                $wageRevenue = $this->wageRevenue($lockedShift, $group);
+                $assignedEmployees = $this->employeesForWages($lockedShift, $group)
+                    ->filter(fn (Employee $employee) => $employee->status === 'active'
+                        && $employee->pay_auto
+                        && in_array($employee->pay_type, ['daily', 'percentage'], true)
+                        && ($employee->pay_type === 'daily'
+                            ? (float) $employee->pay_rate
+                            : $wageRevenue * ((float) $employee->pay_rate / 100)) > 0);
+                $unpaidEmployees = [];
+                foreach ($assignedEmployees as $assignedEmployee) {
+                    $reference = $this->wageReference(
+                        $assignedEmployee,
+                        Carbon::parse($lockedShift->shift_date)->toDateString(),
+                        $lockedShift,
+                        $group
+                    );
+                    $isPaid = $assignedEmployee->pivot->paid_at
+                        || JournalEntry::where('restaurant_id', $lockedShift->restaurant_id)
+                            ->where('reference', $reference)
+                            ->exists();
+                    if (! $isPaid) {
+                        $unpaidEmployees[] = $assignedEmployee->name;
+                    }
+                }
+                if (! empty($unpaidEmployees)) {
+                    $message = 'لا يمكن إغلاق الوردية قبل تسوية أجور الموظفين. الموظفون الذين لم تُسوى أجورهم: '
+                        .implode('، ', $unpaidEmployees);
+                    throw new HttpResponseException(response()->json([
+                        'message' => $message,
+                        'errors' => ['status' => [$message]],
+                    ], 422));
+                }
+
                 $hasOtherOpenShift = $group
                     ? Shift::where('shift_group_id', $group->id)
                         ->where('status', 'open')
@@ -1108,7 +1109,7 @@ class ShiftController extends Controller
 
             return response()->json([
                 'shift' => $shift->fresh()->load('user'),
-                'message' => $journalCreated ? 'تم إغلاق الوردية وإنشاء قيد الوردية بنجاح' : 'تم إغلاق الوردية',
+                'message' => $journalCreated ? 'تم إغلاق الوردية وإنشاء قيود الوردية بنجاح' : 'تم إغلاق الوردية بنجاح',
             ]);
         } elseif ($request->has('actual_cash')) {
             $expected = (float) ($shift->expected_cash ?? $shift->opening_cash ?? 0);
@@ -1119,7 +1120,7 @@ class ShiftController extends Controller
         }
         $shift->update($validated);
 
-        return response()->json(['shift' => $shift->fresh()->load('user'), 'message' => $journalCreated ? 'تم إغلاق الوردية وإنشاء قيد الوردية بنجاح' : 'تم إغلاق الوردية']);
+        return response()->json(['shift' => $shift->fresh()->load('user'), 'message' => $journalCreated ? 'تم إغلاق الوردية وإنشاء قيود الوردية بنجاح' : 'تم إغلاق الوردية بنجاح']);
     }
 
     public function destroy(Shift $shift)
