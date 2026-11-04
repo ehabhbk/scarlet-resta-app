@@ -19,9 +19,7 @@ class AuthController extends Controller
     public function login(LoginRequest $request)
     {
         $login = $request->username;
-        $user = User::where('username', $login)
-            ->orWhere('email', $login)
-            ->first();
+        $user = User::where('username', $login)->first();
 
         if (! $user || ! Hash::check($request->password, $user->password)) {
             return response()->json(['message' => 'بيانات تسجيل الدخول غير صحيحة'], 401);
