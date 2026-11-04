@@ -23,6 +23,7 @@ class Order extends Model
         'status',
         'payment_status',
         'payment_method',
+        'payment_methods',
         'subtotal',
         'discount_amount',
         'discount_percent',
@@ -52,6 +53,7 @@ class Order extends Model
         'delivery_fee' => 'decimal:4',
         'completed_at' => 'datetime',
         'cancelled_at' => 'datetime',
+        'payment_methods' => 'json',
     ];
 
     public function restaurant(): BelongsTo

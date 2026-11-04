@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Models\Account;
 use App\Models\Attendance;
 use App\Models\Employee;
+use App\Models\Expense;
 use App\Models\JournalEntry;
 use App\Models\Order;
 use App\Models\Payment;
@@ -729,7 +730,12 @@ class ShiftController extends Controller
     public function revenue(Request $request, Shift $shift)
     {
         abort_unless($shift->restaurant_id === $request->user()->restaurant_id, 403);
-        abort_unless($request->user()->hasPermissionTo('view_pos', 'sanctum'), 403);
+        abort_unless(
+            $request->user()->hasPermissionTo('view_pos', 'sanctum')
+                || $request->user()->hasPermissionTo('view_all_shifts', 'sanctum')
+                || $request->user()->hasPermissionTo('close_shift', 'sanctum'),
+            403
+        );
         abort_unless(
             (int) $shift->user_id === (int) $request->user()->id
                 || $request->user()->hasPermissionTo('view_all_shifts', 'sanctum'),
@@ -739,26 +745,54 @@ class ShiftController extends Controller
         $shifts = $shift->shift_group_id && $request->user()->hasPermissionTo('view_all_shifts', 'sanctum')
             ? $shift->group->shifts()->with('user')->get()
             : collect([$shift->load('user')]);
-        $cashiers = $shifts->map(function (Shift $cashierShift) {
+
+        $allOrders = collect();
+
+        $cashiers = $shifts->map(function (Shift $cashierShift) use (&$allOrders) {
             $orders = Order::where('restaurant_id', $cashierShift->restaurant_id)
                 ->where('shift_id', $cashierShift->id)
                 ->where(function ($query) {
                     $query->where('payment_status', 'paid')->orWhere('status', 'completed');
                 })
+                ->with(['table', 'customer', 'items.product', 'payments'])
+                ->orderBy('created_at')
                 ->get();
-            $payments = Payment::where('paymentable_type', Order::class)
-                ->whereIn('paymentable_id', $orders->pluck('id'))
-                ->get();
+
             $byPayment = [];
-            foreach ($payments as $payment) {
-                $method = $payment->method ?: 'cash';
-                $byPayment[$method] = ($byPayment[$method] ?? 0) + (float) $payment->amount;
-            }
-            if ($payments->isEmpty()) {
-                foreach ($orders as $order) {
+            foreach ($orders as $order) {
+                $orderMethods = [];
+                foreach ($order->payments as $payment) {
+                    $method = $payment->method ?: 'cash';
+                    $byPayment[$method] = ($byPayment[$method] ?? 0) + (float) $payment->amount;
+                    $orderMethods[$method] = ($orderMethods[$method] ?? 0) + (float) $payment->amount;
+                }
+                if ($order->payments->isEmpty()) {
                     $method = $order->payment_method ?: 'cash';
                     $byPayment[$method] = ($byPayment[$method] ?? 0) + (float) $order->total_amount;
+                    $orderMethods[$method] = (float) $order->total_amount;
                 }
+
+                $allOrders->push([
+                    'id' => $order->id,
+                    'order_number' => $order->order_number,
+                    'type' => $order->type,
+                    'status' => $order->status,
+                    'payment_status' => $order->payment_status,
+                    'table_name' => $order->table?->name,
+                    'customer_name' => $order->customer?->name,
+                    'cashier_name' => $cashierShift->user?->name,
+                    'items_count' => (int) $order->items->sum('quantity'),
+                    'items' => $order->items->map(fn ($item) => [
+                        'name' => $item->product?->name ?: $item->name,
+                        'quantity' => (int) $item->quantity,
+                        'total_price' => (float) $item->total_price,
+                    ])->values(),
+                    'total_amount' => (float) $order->total_amount,
+                    'amount_paid' => (float) $order->amount_paid,
+                    'change_due' => (float) $order->change_due,
+                    'payment_methods' => $orderMethods,
+                    'created_at' => $order->created_at?->toISOString(),
+                ]);
             }
 
             return [
@@ -770,6 +804,7 @@ class ShiftController extends Controller
                 'by_payment_method' => array_map(fn ($amount) => round($amount, 4), $byPayment),
             ];
         })->values();
+
         $byPayment = [];
         foreach ($cashiers as $cashier) {
             foreach ($cashier['by_payment_method'] as $method => $amount) {
@@ -777,11 +812,44 @@ class ShiftController extends Controller
             }
         }
 
+        $shiftDates = $shifts->pluck('shift_date')
+            ->filter()
+            ->map(fn ($date) => Carbon::parse($date)->toDateString())
+            ->unique()
+            ->values();
+
+        $expenses = Expense::where('restaurant_id', $shift->restaurant_id)
+            ->whereIn(DB::raw('DATE(expense_date)'), $shiftDates->all())
+            ->with('user')
+            ->orderBy('expense_date')
+            ->get()
+            ->map(fn (Expense $expense) => [
+                'id' => $expense->id,
+                'category' => $expense->category,
+                'description' => $expense->description,
+                'amount' => (float) $expense->amount,
+                'payment_method' => $expense->payment_method,
+                'expense_date' => $expense->expense_date?->toDateString(),
+                'user_name' => $expense->user?->name,
+            ])->values();
+
+        $ordersTotal = round((float) $cashiers->sum('total'), 4);
+        $expensesTotal = round((float) $expenses->sum('amount'), 4);
+        $baseShift = $shifts->firstWhere('id', $shift->id) ?: $shift;
+
         return response()->json([
-            'total' => round((float) $cashiers->sum('total'), 4),
+            'total' => $ordersTotal,
             'by_payment_method' => array_map(fn ($v) => round($v, 4), $byPayment),
-            'orders_count' => $cashiers->sum('orders_count'),
+            'orders_count' => $allOrders->count(),
             'cashiers' => $cashiers,
+            'orders' => $allOrders->values(),
+            'expenses' => $expenses,
+            'expenses_total' => $expensesTotal,
+            'net_total' => round($ordersTotal - $expensesTotal, 4),
+            'opening_cash' => (float) $baseShift->opening_cash,
+            'expected_cash' => (float) $baseShift->expected_cash,
+            'actual_cash' => (float) $baseShift->actual_cash,
+            'difference' => (float) $baseShift->difference,
         ]);
     }
 

@@ -299,7 +299,8 @@ class OrderController extends Controller
             'customer_notes' => 'nullable|string',
             'discount_amount' => 'nullable|numeric|min:0',
             'discount_percent' => 'sometimes|numeric|min:0|max:100',
-            'payment_method' => 'sometimes|string|max:50',
+            'payment_method' => 'sometimes|nullable|string|max:50',
+            'payment_methods' => 'sometimes|array',
             'amount_received' => 'sometimes|numeric|min:0',
             'items' => 'sometimes|array|min:1',
             'items.*.product_id' => 'required_with:items|integer|exists:products,id',
@@ -312,16 +313,40 @@ class OrderController extends Controller
         ]);
 
         return DB::transaction(function () use ($validated, $request, $order) {
-            $updates = collect($validated)->except(['items', 'amount_received'])->all();
-            if (array_key_exists('payment_method', $validated)) {
-                app(JournalPostingService::class)
-                    ->assertConfiguredPaymentMethod($order->restaurant_id, $validated['payment_method']);
-                Payment::where('paymentable_type', Order::class)
-                    ->where('paymentable_id', $order->id)
-                    ->where('amount', '>', 0)
-                    ->update(['method' => $validated['payment_method'], 'updated_at' => now()]);
-                $updates['payment_method'] = $validated['payment_method'];
+            $updates = collect($validated)
+                ->except(['items', 'amount_received', 'payment_methods', 'payment_method'])
+                ->all();
+
+            $amountReceivedProvided = array_key_exists('amount_received', $validated);
+            $amountReceived = $amountReceivedProvided ? (float) $validated['amount_received'] : null;
+            $singlePaymentMethod = isset($validated['payment_method'])
+                && trim((string) $validated['payment_method']) !== ''
+                ? trim((string) $validated['payment_method'])
+                : null;
+
+            // Normalise requested payment methods. Every entry may be either a plain
+            // method name or an object containing an explicit amount.
+            $requestedMethods = [];
+            foreach (($validated['payment_methods'] ?? []) as $entry) {
+                if (is_array($entry)) {
+                    $method = trim((string) ($entry['method'] ?? $entry['value'] ?? ''));
+                    if ($method === '') {
+                        continue;
+                    }
+                    $requestedMethods[] = [
+                        'method' => $method,
+                        'amount' => array_key_exists('amount', $entry) ? (float) $entry['amount'] : null,
+                    ];
+                } else {
+                    $method = trim((string) $entry);
+                    if ($method !== '') {
+                        $requestedMethods[] = ['method' => $method, 'amount' => null];
+                    }
+                }
             }
+
+            $total = (float) $order->total_amount;
+
             if (isset($validated['items'])) {
                 $user = $request->user();
                 $restaurant = $user->restaurant;
@@ -386,41 +411,6 @@ class OrderController extends Controller
                 $taxRate = (float) ($restaurant?->tax_rate ?? 0);
                 $tax = ($subtotal - $discount) * $taxRate;
                 $total = $subtotal - $discount + $tax + (float) $order->delivery_fee;
-                $paid = max(0, (float) $order->amount_paid - (float) $order->change_due);
-                $amountPaid = $paid;
-                $changeDue = 0;
-                $method = $validated['payment_method'] ?? $order->payment_method ?? 'cash';
-
-                if ($paid > $total) {
-                    $refundAmount = $paid - $total;
-                    Payment::create([
-                        'restaurant_id' => $order->restaurant_id,
-                        'paymentable_type' => Order::class,
-                        'paymentable_id' => $order->id,
-                        'amount' => -$refundAmount,
-                        'method' => $method,
-                        'paid_at' => now(),
-                        'user_id' => $user->id,
-                        'notes' => 'استرداد فرق تعديل أصناف الطلب',
-                    ]);
-                    $paid = $total;
-                    $amountPaid = $total;
-                } elseif ($paid < $total && (float) ($validated['amount_received'] ?? 0) > 0) {
-                    $received = (float) $validated['amount_received'];
-                    Payment::create([
-                        'restaurant_id' => $order->restaurant_id,
-                        'paymentable_type' => Order::class,
-                        'paymentable_id' => $order->id,
-                        'amount' => $received,
-                        'method' => $method,
-                        'paid_at' => now(),
-                        'user_id' => $user->id,
-                        'notes' => 'دفعة فرق تعديل أصناف الطلب',
-                    ]);
-                    $amountPaid += $received;
-                    $changeDue = max(0, $amountPaid - $total);
-                    $paid = min($amountPaid, $total);
-                }
 
                 $updates = array_merge($updates, [
                     'subtotal' => $subtotal,
@@ -428,12 +418,82 @@ class OrderController extends Controller
                     'discount_percent' => $discountPercent,
                     'tax_amount' => $tax,
                     'total_amount' => $total,
-                    'amount_paid' => $amountPaid,
-                    'change_due' => $changeDue,
-                    'payment_status' => $paid >= $total ? 'paid' : ($paid > 0 ? 'partial' : 'unpaid'),
-                    'payment_method' => $method,
                 ]);
             }
+
+            // Existing payments are only replaced when the caller explicitly sends
+            // the full list of payment methods. This keeps previously recorded
+            // payments (e.g. cash) intact when an extra method is paid later.
+            if (! empty($requestedMethods)) {
+                $paymentTotals = $this->distributePaymentAmounts(
+                    $requestedMethods,
+                    $amountReceived ?? ($total > 0 ? $total : (float) $order->amount_paid)
+                );
+
+                Payment::where('paymentable_type', Order::class)
+                    ->where('paymentable_id', $order->id)
+                    ->delete();
+
+                foreach ($paymentTotals as $method => $amount) {
+                    if ($amount <= 0) {
+                        continue;
+                    }
+                    app(JournalPostingService::class)
+                        ->assertConfiguredPaymentMethod($order->restaurant_id, $method);
+                    Payment::create([
+                        'restaurant_id' => $order->restaurant_id,
+                        'paymentable_type' => Order::class,
+                        'paymentable_id' => $order->id,
+                        'amount' => $amount,
+                        'method' => $method,
+                        'reference' => null,
+                        'transaction_id' => null,
+                        'paid_at' => now(),
+                        'user_id' => $request->user()->id,
+                        'notes' => 'تعديل طلب - طريقة دفع',
+                    ]);
+                }
+
+                $amountPaid = array_sum($paymentTotals);
+                $updates['payment_methods'] = array_keys($paymentTotals);
+                $updates['payment_method'] = array_key_first($paymentTotals)
+                    ?? $singlePaymentMethod
+                    ?? $order->payment_method;
+            } else {
+                $amountPaid = (float) $order->amount_paid;
+
+                // Allow callers to move the recorded paid amount explicitly. A
+                // positive difference creates a new payment row so the revenue
+                // breakdown stays accurate; existing rows are never mutated.
+                if ($amountReceived !== null) {
+                    $delta = round($amountReceived - $amountPaid, 2);
+                    if ($delta > 0) {
+                        $method = $singlePaymentMethod ?? $order->payment_method ?? 'cash';
+                        app(JournalPostingService::class)
+                            ->assertConfiguredPaymentMethod($order->restaurant_id, $method);
+                        Payment::create([
+                            'restaurant_id' => $order->restaurant_id,
+                            'paymentable_type' => Order::class,
+                            'paymentable_id' => $order->id,
+                            'amount' => $delta,
+                            'method' => $method,
+                            'reference' => null,
+                            'transaction_id' => null,
+                            'paid_at' => now(),
+                            'user_id' => $request->user()->id,
+                            'notes' => 'تعديل طلب - تسوية دفعة',
+                        ]);
+                        $updates['payment_method'] = $method;
+                    }
+                    $amountPaid = $amountReceived;
+                }
+            }
+
+            $updates['amount_paid'] = $amountPaid;
+            $updates['change_due'] = max(0, $amountPaid - $total);
+            $updates['payment_status'] = $total > 0 && $amountPaid >= $total
+                ? 'paid'
+                : ($amountPaid > 0 ? 'partial' : 'unpaid');
 
             $order->update($updates);
 
@@ -684,6 +744,44 @@ class OrderController extends Controller
 
             return response()->json(['payment' => $payment, 'order' => $order->fresh(), 'message' => 'تم تسجيل الدفعة']);
         }, 5);
+    }
+
+    private function distributePaymentAmounts(array $entries, float $pool): array
+    {
+        $result = [];
+        $missing = [];
+        $providedSum = 0.0;
+
+        foreach ($entries as $entry) {
+            $method = $entry['method'];
+            $amount = $entry['amount'];
+
+            if ($amount === null) {
+                $missing[] = $method;
+                continue;
+            }
+
+            $providedSum += $amount;
+            $result[$method] = ($result[$method] ?? 0) + $amount;
+        }
+
+        if (empty($missing)) {
+            return $result;
+        }
+
+        $remaining = max(0, round($pool - $providedSum, 2));
+        $count = count($missing);
+
+        foreach ($missing as $index => $method) {
+            $left = $count - $index;
+            $share = $index === $count - 1
+                ? $remaining
+                : round($remaining / $left, 2);
+            $result[$method] = ($result[$method] ?? 0) + $share;
+            $remaining = round($remaining - $share, 2);
+        }
+
+        return $result;
     }
 
     private function authorizeOrder(Order $order, Request $request, string $permission): void
