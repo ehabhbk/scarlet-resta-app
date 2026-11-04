@@ -7,6 +7,7 @@ use App\Support\PublicMediaUrl;
 use App\Models\Order;
 use App\Models\Product;
 use App\Models\Expense;
+use App\Models\Purchase;
 use App\Models\InventoryItem;
 use App\Models\User;
 use Illuminate\Http\Request;
@@ -20,18 +21,35 @@ class DashboardController extends Controller
         $restaurantId = $request->user()->restaurant_id;
         $today = Carbon::today();
         $monthStart = Carbon::now()->startOfMonth();
+        $now = Carbon::now();
 
-        $todayOrders = Order::where('restaurant_id', $restaurantId)
-            ->whereDate('created_at', $today);
+        $todayRevenue = (float) Order::where('restaurant_id', $restaurantId)
+            ->where('payment_status', 'paid')
+            ->whereDate('created_at', $today)
+            ->sum('total_amount');
 
-        $monthOrders = Order::where('restaurant_id', $restaurantId)
-            ->whereBetween('created_at', [$monthStart, Carbon::now()]);
+        $todayPurchases = (float) Purchase::where('restaurant_id', $restaurantId)
+            ->where('status', '!=', 'cancelled')
+            ->whereDate('order_date', $today)
+            ->sum('total_amount');
 
-        $todayRevenue = $todayOrders->where('payment_status', 'paid')->sum('total_amount');
-        $monthRevenue = $monthOrders->where('payment_status', 'paid')->sum('total_amount');
+        $todayExpenses = (float) Expense::where('restaurant_id', $restaurantId)
+            ->whereDate('expense_date', $today)
+            ->sum('amount');
 
-        $todayCount = $todayOrders->count();
-        $monthCount = $monthOrders->count();
+        $monthRevenue = (float) Order::where('restaurant_id', $restaurantId)
+            ->where('payment_status', 'paid')
+            ->whereBetween('created_at', [$monthStart, $now])
+            ->sum('total_amount');
+
+        $monthPurchases = (float) Purchase::where('restaurant_id', $restaurantId)
+            ->where('status', '!=', 'cancelled')
+            ->whereBetween('order_date', [$monthStart->toDateString(), $today->toDateString()])
+            ->sum('total_amount');
+
+        $monthExpenses = (float) Expense::where('restaurant_id', $restaurantId)
+            ->whereBetween('expense_date', [$monthStart->toDateString(), $today->toDateString()])
+            ->sum('amount');
 
         $completed = Order::where('restaurant_id', $restaurantId)
             ->where('status', 'completed')->whereDate('created_at', $today)->count();
@@ -40,39 +58,87 @@ class DashboardController extends Controller
         $pending = Order::where('restaurant_id', $restaurantId)
             ->whereIn('status', ['pending', 'confirmed', 'preparing', 'ready'])->count();
 
-        $monthExpense = Expense::where('restaurant_id', $restaurantId)
-            ->whereBetween('expense_date', [$monthStart, Carbon::now()])->sum('amount');
+        [$from, $to] = $this->resolveRange($request);
 
-        $netProfit = $monthRevenue - $monthExpense;
+        $periodRevenue = (float) Order::where('restaurant_id', $restaurantId)
+            ->where('payment_status', 'paid')
+            ->whereBetween('created_at', [$from, $to])
+            ->sum('total_amount');
+
+        $periodPurchases = (float) Purchase::where('restaurant_id', $restaurantId)
+            ->where('status', '!=', 'cancelled')
+            ->whereBetween('order_date', [$from->toDateString(), $to->toDateString()])
+            ->sum('total_amount');
+
+        $periodExpenses = (float) Expense::where('restaurant_id', $restaurantId)
+            ->whereBetween('expense_date', [$from->toDateString(), $to->toDateString()])
+            ->sum('amount');
+
+        $periodOrders = Order::where('restaurant_id', $restaurantId)
+            ->where('payment_status', 'paid')
+            ->whereBetween('created_at', [$from, $to])
+            ->count();
+
+        $monthProfit = $monthRevenue - $monthExpenses - $monthPurchases;
 
         $lowStock = InventoryItem::where('restaurant_id', $restaurantId)
             ->whereColumn('current_stock', '<=', 'min_stock')->count();
 
         return response()->json([
-            'today_revenue' => (float) $todayRevenue,
-            'month_revenue' => (float) $monthRevenue,
-            'today_orders' => (int) $todayCount,
-            'month_orders' => (int) $monthCount,
+            'today_revenue' => $todayRevenue,
+            'today_purchases' => $todayPurchases,
+            'today_expenses' => $todayExpenses,
+            'today_profit' => $todayRevenue - $todayExpenses - $todayPurchases,
+            'today_orders' => (int) Order::where('restaurant_id', $restaurantId)->whereDate('created_at', $today)->count(),
+
+            'month_revenue' => $monthRevenue,
+            'month_purchases' => $monthPurchases,
+            'month_expenses' => $monthExpenses,
+            'month_profit' => $monthProfit,
+            'month_orders' => (int) Order::where('restaurant_id', $restaurantId)
+                ->whereBetween('created_at', [$monthStart, $now])->count(),
+
+            // Backwards-compatible aliases used by older widgets.
+            'month_expense' => $monthExpenses,
+            'net_profit' => $monthProfit,
+
             'completed_today' => (int) $completed,
             'cancelled_today' => (int) $cancelled,
             'pending_orders' => (int) $pending,
-            'month_expense' => (float) $monthExpense,
-            'net_profit' => (float) $netProfit,
             'low_stock_alerts' => (int) $lowStock,
+
+            'period' => [
+                'from' => $from->toDateString(),
+                'to' => $to->toDateString(),
+                'revenue' => $periodRevenue,
+                'purchases' => $periodPurchases,
+                'expenses' => $periodExpenses,
+                'profit' => $periodRevenue - $periodExpenses - $periodPurchases,
+                'orders' => (int) $periodOrders,
+            ],
         ]);
     }
 
     public function salesChart(Request $request)
     {
         $restaurantId = $request->user()->restaurant_id;
-        $range = $request->query('range', '7d'); // 7d, 30d, 90d
 
-        $days = $range === '30d' ? 30 : ($range === '90d' ? 90 : 7);
-        $start = Carbon::now()->subDays($days - 1)->startOfDay();
+        if ($request->filled('from') || $request->filled('to')) {
+            [$from, $to] = $this->resolveRange($request);
+            $days = $from->diffInDays($to) + 1;
+            if ($days > 366) {
+                $from = $to->copy()->subDays(365)->startOfDay();
+            }
+        } else {
+            $range = $request->query('range', '7d');
+            $days = $range === '30d' ? 30 : ($range === '90d' ? 90 : 7);
+            $from = Carbon::now()->subDays($days - 1)->startOfDay();
+            $to = Carbon::now()->endOfDay();
+        }
 
         $sales = Order::where('restaurant_id', $restaurantId)
             ->where('payment_status', 'paid')
-            ->where('created_at', '>=', $start)
+            ->whereBetween('created_at', [$from, $to])
             ->select(DB::raw('DATE(created_at) as date'), DB::raw('SUM(total_amount) as total'), DB::raw('COUNT(*) as count'))
             ->groupBy('date')
             ->orderBy('date')
@@ -80,25 +146,37 @@ class DashboardController extends Controller
 
         $labels = [];
         $data = [];
-        for ($i = $days - 1; $i >= 0; $i--) {
-            $date = Carbon::now()->subDays($i)->format('Y-m-d');
-            $labels[] = Carbon::parse($date)->format('d M');
+        for ($cursor = $from->copy(); $cursor->lte($to); $cursor->addDay()) {
+            $date = $cursor->format('Y-m-d');
+            $labels[] = $cursor->format('d M');
             $found = $sales->firstWhere('date', $date);
             $data[] = $found ? (float) $found->total : 0;
         }
 
-        return response()->json(['labels' => $labels, 'data' => $data]);
+        return response()->json([
+            'labels' => $labels,
+            'data' => $data,
+            'from' => $from->toDateString(),
+            'to' => $to->toDateString(),
+        ]);
     }
 
     public function topProducts(Request $request)
     {
         $restaurantId = $request->user()->restaurant_id;
-        $limit = (int) $request->query('limit', 10);
+        $limit = min(max((int) $request->query('limit', 10), 1), 50);
 
-        $rows = DB::table('order_items')
+        $query = DB::table('order_items')
             ->join('orders', 'orders.id', '=', 'order_items.order_id')
             ->where('orders.restaurant_id', $restaurantId)
-            ->where('orders.status', '!=', 'cancelled')
+            ->where('orders.status', '!=', 'cancelled');
+
+        if ($request->filled('from') || $request->filled('to')) {
+            [$from, $to] = $this->resolveRange($request);
+            $query->whereBetween('orders.created_at', [$from, $to]);
+        }
+
+        $rows = $query
             ->select(
                 'order_items.product_id',
                 DB::raw('SUM(order_items.quantity) as sales_count'),
@@ -155,6 +233,124 @@ class DashboardController extends Controller
         return response()->json(['staff' => $staff]);
     }
 
+    public function breakdowns(Request $request)
+    {
+        $restaurantId = $request->user()->restaurant_id;
+        [$from, $to] = $this->resolveRange($request);
+        $fromDate = $from->toDateString();
+        $toDate = $to->toDateString();
+
+        $normalize = fn ($rows) => $rows->map(fn ($row) => [
+            'name' => $row->name ?: 'غير محدد',
+            'value' => (float) $row->value,
+        ])->filter(fn ($row) => $row['value'] > 0)->values();
+
+        $sales = $normalize(Order::where('restaurant_id', $restaurantId)
+            ->where('payment_status', 'paid')
+            ->whereBetween('created_at', [$from, $to])
+            ->select('type as name', DB::raw('SUM(total_amount) as value'))
+            ->groupBy('type')
+            ->orderByDesc('value')
+            ->get());
+
+        $purchases = $normalize(DB::table('purchases')
+            ->join('suppliers', 'suppliers.id', '=', 'purchases.supplier_id')
+            ->where('purchases.restaurant_id', $restaurantId)
+            ->where('purchases.status', '!=', 'cancelled')
+            ->whereBetween('purchases.order_date', [$fromDate, $toDate])
+            ->select('suppliers.name as name', DB::raw('SUM(purchases.total_amount) as value'))
+            ->groupBy('suppliers.name')
+            ->orderByDesc('value')
+            ->get());
+
+        $expenses = $normalize(Expense::where('restaurant_id', $restaurantId)
+            ->whereBetween('expense_date', [$fromDate, $toDate])
+            ->select('category as name', DB::raw('SUM(amount) as value'))
+            ->groupBy('category')
+            ->orderByDesc('value')
+            ->get());
+
+        $productQuery = DB::table('order_items')
+            ->join('orders', 'orders.id', '=', 'order_items.order_id')
+            ->join('products', 'products.id', '=', 'order_items.product_id')
+            ->where('orders.restaurant_id', $restaurantId)
+            ->where('orders.payment_status', 'paid')
+            ->where('orders.status', '!=', 'cancelled')
+            ->whereBetween('orders.created_at', [$from, $to]);
+
+        $productTotal = (float) (clone $productQuery)->sum('order_items.total_price');
+        $productRows = (clone $productQuery)
+            ->select('products.name as name', DB::raw('SUM(order_items.total_price) as value'))
+            ->groupBy('products.name')
+            ->orderByDesc('value')
+            ->limit(8)
+            ->get();
+
+        $products = $normalize($productRows);
+        $shownProductTotal = (float) $productRows->sum('value');
+        if ($productTotal - $shownProductTotal > 0.01) {
+            $products->push([
+                'name' => 'منتجات أخرى',
+                'value' => $productTotal - $shownProductTotal,
+            ]);
+        }
+
+        $categories = $normalize(DB::table('order_items')
+            ->join('orders', 'orders.id', '=', 'order_items.order_id')
+            ->leftJoin('products', 'products.id', '=', 'order_items.product_id')
+            ->leftJoin('categories', 'categories.id', '=', 'products.category_id')
+            ->where('orders.restaurant_id', $restaurantId)
+            ->where('orders.payment_status', 'paid')
+            ->where('orders.status', '!=', 'cancelled')
+            ->whereBetween('orders.created_at', [$from, $to])
+            ->select(DB::raw("COALESCE(categories.name, 'بدون صنف') as name"), DB::raw('SUM(order_items.total_price) as value'))
+            ->groupByRaw("COALESCE(categories.name, 'بدون صنف')")
+            ->orderByDesc('value')
+            ->get());
+
+        $employees = $normalize(DB::table('orders')
+            ->join('users', 'users.id', '=', 'orders.cashier_id')
+            ->where('orders.restaurant_id', $restaurantId)
+            ->where('orders.payment_status', 'paid')
+            ->whereBetween('orders.created_at', [$from, $to])
+            ->select('users.name as name', DB::raw('SUM(orders.total_amount) as value'))
+            ->groupBy('users.name')
+            ->orderByDesc('value')
+            ->get());
+
+        $paymentRows = DB::table('payments')
+            ->where('restaurant_id', $restaurantId)
+            ->where('paymentable_type', Order::class)
+            ->whereBetween('paid_at', [$from, $to])
+            ->select('method as name', DB::raw('SUM(amount) as value'))
+            ->groupBy('method')
+            ->orderByDesc('value')
+            ->get();
+
+        if ($paymentRows->isEmpty()) {
+            $paymentRows = Order::where('restaurant_id', $restaurantId)
+                ->where('payment_status', 'paid')
+                ->whereBetween('created_at', [$from, $to])
+                ->whereNotNull('payment_method')
+                ->select('payment_method as name', DB::raw('SUM(total_amount) as value'))
+                ->groupBy('payment_method')
+                ->orderByDesc('value')
+                ->get();
+        }
+
+        return response()->json([
+            'from' => $fromDate,
+            'to' => $toDate,
+            'sales' => $sales,
+            'purchases' => $purchases,
+            'expenses' => $expenses,
+            'products' => $products->values(),
+            'categories' => $categories,
+            'employees' => $employees,
+            'payment_methods' => $normalize($paymentRows),
+        ]);
+    }
+
     public function inventoryAlerts(Request $request)
     {
         $restaurantId = $request->user()->restaurant_id;
@@ -174,5 +370,40 @@ class DashboardController extends Controller
             });
 
         return response()->json(['low_stock' => $items]);
+    }
+
+    /**
+     * Resolve the requested date range, defaulting to the current month.
+     *
+     * @return array{0: Carbon, 1: Carbon}
+     */
+    private function resolveRange(Request $request): array
+    {
+        $from = Carbon::now()->startOfMonth();
+        $to = Carbon::now()->endOfDay();
+
+        if ($request->filled('from')) {
+            try {
+                $from = Carbon::parse((string) $request->query('from'))->startOfDay();
+            } catch (\Throwable) {
+                $from = Carbon::now()->startOfMonth();
+            }
+        }
+
+        if ($request->filled('to')) {
+            try {
+                $to = Carbon::parse((string) $request->query('to'))->endOfDay();
+            } catch (\Throwable) {
+                $to = Carbon::now()->endOfDay();
+            }
+        }
+
+        if ($to->lt($from)) {
+            $swap = $from->copy();
+            $from = $to->copy()->startOfDay();
+            $to = $swap->copy()->endOfDay();
+        }
+
+        return [$from, $to];
     }
 }

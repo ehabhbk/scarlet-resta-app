@@ -53,6 +53,7 @@ Route::middleware(['auth:sanctum', 'audit', 'api.permission:dashboard'])->prefix
     Route::get('top-products', [\App\Http\Controllers\API\DashboardController::class, 'topProducts']);
     Route::get('staff-performance', [\App\Http\Controllers\API\DashboardController::class, 'staffPerformance']);
     Route::get('inventory-alerts', [\App\Http\Controllers\API\DashboardController::class, 'inventoryAlerts']);
+    Route::get('breakdowns', [\App\Http\Controllers\API\DashboardController::class, 'breakdowns']);
 });
 
 // Restaurants
