@@ -15,7 +15,7 @@ class LoginRequest extends FormRequest
     {
         return [
             'username' => 'required|string',
-            'password' => 'required|string|min:6',
+            'password' => 'required|string',
         ];
     }
 
@@ -24,7 +24,6 @@ class LoginRequest extends FormRequest
         return [
             'username.required' => 'اسم المستخدم مطلوب',
             'password.required' => 'كلمة المرور مطلوبة',
-            'password.min' => 'كلمة المرور يجب أن تكون 6 أحرف على الأقل',
         ];
     }
 }

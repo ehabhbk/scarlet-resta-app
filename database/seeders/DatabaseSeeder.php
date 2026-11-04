@@ -165,7 +165,7 @@ class DatabaseSeeder extends Seeder
             'name' => 'مدير النظام',
             'username' => 'admin',
             'email' => 'admin@scarletresta.com',
-            'password' => Hash::make('admin123'),
+            'password' => Hash::make('admin'),
             'restaurant_id' => $restaurant->id,
             'phone' => '+966500000001',
             'is_active' => true,
