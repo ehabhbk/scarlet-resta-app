@@ -9,6 +9,8 @@ return [
     'allowed_origins' => [
         'http://localhost:5173',
         'http://localhost:3000',
+        'http://localhost:2060',
+        'http://127.0.0.1:2060',
         'http://server',
         'http://server:2060',
         'http://server:80',

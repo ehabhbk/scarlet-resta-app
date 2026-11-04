@@ -84,6 +84,7 @@ Route::middleware(['auth:sanctum', 'audit'])->post('orders/{order}/cancel', [\Ap
 Route::middleware(['auth:sanctum', 'audit'])->post('orders/{order}/refund', [\App\Http\Controllers\API\OrderController::class, 'refund']);
 Route::middleware(['auth:sanctum', 'audit'])->post('orders/{order}/status', [\App\Http\Controllers\API\OrderController::class, 'updateStatus']);
 Route::middleware(['auth:sanctum', 'audit'])->post('orders/{order}/payment', [\App\Http\Controllers\API\OrderController::class, 'recordPayment']);
+Route::middleware(['auth:sanctum', 'audit'])->put('orders/{order}/payments', [\App\Http\Controllers\API\OrderController::class, 'updatePayments']);
 
 // Kitchen
 Route::middleware(['auth:sanctum', 'audit', 'api.permission:kitchen'])->prefix('kitchen')->group(function () {

@@ -294,6 +294,17 @@ class OrderController extends Controller
         if (in_array($order->status, ['cancelled'], true) || $order->payment_status === 'refunded') {
             return response()->json(['message' => 'لا يمكن تعديل طلب ملغي أو مسترد'], 400);
         }
+        if (
+            $request->has('payment_methods')
+            || $request->has('amount_received')
+            || $request->has('payment_method')
+        ) {
+            abort_unless(
+                $request->user()->hasPermissionTo('edit_order_payment', 'sanctum'),
+                403,
+                'لا تملك صلاحية تعديل طريقة دفع الطلب'
+            );
+        }
         $validated = $request->validate([
             'notes' => 'nullable|string',
             'customer_notes' => 'nullable|string',
@@ -712,9 +723,101 @@ class OrderController extends Controller
         return response()->json(['order' => $order->fresh(), 'message' => 'تم تحديث حالة الطلب']);
     }
 
+    /**
+     * Replace the payment breakdown of an order.
+     *
+     * This is deliberately separate from the general order update so the
+     * dedicated "edit_order_payment" permission can control it.
+     */
+    public function updatePayments(Request $request, Order $order)
+    {
+        $this->authorizeOrder($order, $request, 'edit_order_payment');
+        if (in_array($order->status, ['cancelled'], true) || $order->payment_status === 'refunded') {
+            return response()->json(['message' => 'لا يمكن تعديل دفعات طلب ملغي أو مسترد'], 400);
+        }
+
+        $validated = $request->validate([
+            'payments' => 'required|array|min:1',
+            'payments.*.method' => 'required|string|max:50',
+            'payments.*.amount' => 'required|numeric|min:0',
+            'notes' => 'nullable|string',
+        ]);
+
+        $entries = collect($validated['payments'])
+            ->map(fn (array $entry): array => [
+                'method' => trim((string) $entry['method']),
+                'amount' => round((float) $entry['amount'], 2),
+            ])
+            ->filter(fn (array $entry): bool => $entry['method'] !== '' && $entry['amount'] > 0)
+            ->values();
+
+        if ($entries->isEmpty()) {
+            return response()->json(['message' => 'أضف دفعة واحدة على الأقل بمبلغ أكبر من صفر'], 422);
+        }
+
+        return DB::transaction(function () use ($order, $request, $entries, $validated) {
+            $total = (float) $order->total_amount;
+
+            foreach ($entries as $entry) {
+                app(JournalPostingService::class)
+                    ->assertConfiguredPaymentMethod($order->restaurant_id, $entry['method']);
+            }
+
+            // Replace the full breakdown so the order reflects exactly what the
+            // user entered (one row per method, preserving duplicates by merging).
+            $totalsByMethod = [];
+            foreach ($entries as $entry) {
+                $totalsByMethod[$entry['method']] = round(
+                    ($totalsByMethod[$entry['method']] ?? 0) + $entry['amount'],
+                    2
+                );
+            }
+
+            Payment::where('paymentable_type', Order::class)
+                ->where('paymentable_id', $order->id)
+                ->delete();
+
+            foreach ($totalsByMethod as $method => $amount) {
+                Payment::create([
+                    'restaurant_id' => $order->restaurant_id,
+                    'paymentable_type' => Order::class,
+                    'paymentable_id' => $order->id,
+                    'amount' => $amount,
+                    'method' => $method,
+                    'reference' => null,
+                    'transaction_id' => null,
+                    'paid_at' => now(),
+                    'user_id' => $request->user()->id,
+                    'notes' => $validated['notes'] ?? 'تعديل دفعات الطلب',
+                ]);
+            }
+
+            $amountPaid = array_sum($totalsByMethod);
+            $paymentMethods = array_keys($totalsByMethod);
+
+            $order->update([
+                'payment_method' => $paymentMethods[0] ?? $order->payment_method,
+                'payment_methods' => $paymentMethods,
+                'amount_paid' => $amountPaid,
+                'change_due' => max(0, $amountPaid - $total),
+                'payment_status' => $total > 0 && $amountPaid >= $total
+                    ? 'paid'
+                    : ($amountPaid > 0 ? 'partial' : 'unpaid'),
+            ]);
+
+            return response()->json([
+                'order' => new OrderResource($order->fresh()->load([
+                    'items.product', 'items.size', 'items.modifiers.modifier',
+                    'items.modifiers.modifierOption', 'payments', 'table', 'customer', 'cashier', 'waiter',
+                ])),
+                'message' => 'تم تحديث دفعات الطلب',
+            ]);
+        }, 5);
+    }
+
     public function recordPayment(Request $request, Order $order)
     {
-        $this->authorizeOrder($order, $request, 'edit_orders');
+        $this->authorizeOrder($order, $request, ['edit_orders', 'edit_order_payment']);
         $validated = $request->validate([
             'amount' => 'required|numeric|min:0',
             'method' => 'required|string|max:50',
@@ -784,11 +887,13 @@ class OrderController extends Controller
         return $result;
     }
 
-    private function authorizeOrder(Order $order, Request $request, string $permission): void
+    private function authorizeOrder(Order $order, Request $request, string|array $permission): void
     {
         $user = $request->user();
         abort_unless($order->restaurant_id === $user->restaurant_id, 403);
-        abort_unless($user->hasPermissionTo($permission, 'sanctum'), 403);
+        $allowed = collect((array) $permission)
+            ->contains(fn (string $name): bool => $user->hasPermissionTo($name, 'sanctum'));
+        abort_unless($allowed, 403);
         abort_if(
             (int) $order->cashier_id !== (int) $user->id
                 && ! $user->hasPermissionTo('view_all_orders', 'sanctum'),
