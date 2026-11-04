@@ -14,6 +14,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Validation\Rule;
+use Illuminate\Validation\ValidationException;
 use Spatie\Permission\Models\Permission;
 use Spatie\Permission\Models\Role;
 
@@ -156,10 +157,23 @@ class UserController extends Controller
         }
         unset($validated['image_file']);
         $updateEmployeeAccount = array_key_exists('pay_account_id', $validated);
-        DB::transaction(function () use ($user, $validated, $request, $updateEmployeeAccount) {
+        $role = null;
+        if ($request->has('role')) {
+            $role = Role::where('name', $request->role)
+                ->where('guard_name', 'sanctum')
+                ->first();
+
+            if (! $role) {
+                throw ValidationException::withMessages([
+                    'role' => ['الدور المحدد غير موجود.'],
+                ]);
+            }
+        }
+
+        DB::transaction(function () use ($user, $validated, $role, $updateEmployeeAccount) {
             $user->update($validated);
-            if ($request->has('role')) {
-                $user->syncRoles([$request->role]);
+            if ($role) {
+                $user->syncRoles([$role]);
             }
             $accountService = app(CashierAccountService::class);
             $accountService->ensurePayAccountFor($user);

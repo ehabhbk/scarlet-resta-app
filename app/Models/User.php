@@ -15,6 +15,13 @@ class User extends Authenticatable
     /** @use HasFactory<UserFactory> */
     use HasApiTokens, HasFactory, HasRoles, Notifiable;
 
+    /**
+     * Guard used by Spatie permissions. Without this property the package
+     * falls back to auth.defaults.guard ("web") and cannot resolve the
+     * "sanctum" roles stored in the database.
+     */
+    protected $guard_name = 'sanctum';
+
     public function getGuardName(): string
     {
         return 'sanctum';
