@@ -10,7 +10,7 @@ class EnsureApiPermission
 {
     public function handle(Request $request, Closure $next, string $resource)
     {
-        if ($request->user()->hasAnyRole(['Super Admin', 'Admin'], 'sanctum')) {
+        if ($request->user()->hasAnyRole(['admin', 'Super Admin', 'Admin'], 'sanctum')) {
             return $next($request);
         }
 

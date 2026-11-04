@@ -56,7 +56,7 @@ class UserController extends Controller
                     ->where('is_active', true)),
             ],
             'kitchen_station_id' => [
-                'required_if:role,Chef',
+                'required_if:role,Chef,chef',
                 'nullable',
                 'integer',
                 Rule::exists('kitchen_stations', 'id')->where(fn ($query) => $query
@@ -135,7 +135,7 @@ class UserController extends Controller
             ],
             'kitchen_station_id' => [
                 'sometimes',
-                'required_if:role,Chef',
+                'required_if:role,Chef,chef',
                 'nullable',
                 'integer',
                 Rule::exists('kitchen_stations', 'id')->where(fn ($query) => $query
@@ -234,7 +234,7 @@ class RoleController extends Controller
 
     public function destroy(Role $role)
     {
-        if (in_array($role->name, ['Super Admin'])) {
+        if (in_array($role->name, ['admin', 'Super Admin'])) {
             return response()->json(['message' => 'لا يمكن حذف الدور الأساسي'], 400);
         }
         $role->delete();

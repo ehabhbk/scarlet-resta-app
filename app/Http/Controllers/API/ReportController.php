@@ -225,6 +225,8 @@ class ReportController extends Controller
             }
 
             return array_merge($shift->toArray(), [
+                'shift_number' => $shift->id,
+                'name' => 'وردية #'.$shift->id.' - '.\Illuminate\Support\Carbon::parse($shift->shift_date)->format('Y-m-d'),
                 'user_name' => $shift->user?->name,
                 'orders_count' => $shiftOrders->count(),
                 'by_payment_method' => array_map(fn ($amount) => round($amount, 4), $byPayment),

@@ -915,6 +915,10 @@ class ShiftController extends Controller
                 }
             }
 
+            $group->forceFill([
+                'name' => 'وردية #'.$group->id.' - '.Carbon::parse($group->shift_date)->format('Y-m-d'),
+            ])->save();
+
             $shift = Shift::where('shift_group_id', $group->id)
                 ->where('user_id', $actor->id)
                 ->where('status', 'open')
@@ -937,6 +941,8 @@ class ShiftController extends Controller
                     'difference' => 0,
                     'notes' => $validated['notes'] ?? null,
                 ]);
+            } elseif ($shift->name !== $group->name) {
+                $shift->forceFill(['name' => $group->name])->save();
             }
 
             $shift->setRelation('employees', $group->employees()->get());
