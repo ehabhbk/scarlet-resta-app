@@ -820,11 +820,24 @@ class ShiftWorkflowController extends Controller
             ? $shift->group->shifts()->with('user')->get()
             : collect([$shift->load('user')]);
 
-        $allOrders = collect();
+        $baseShift = $shifts->first() ?: $shift;
+        $restaurantId = $shift->restaurant_id;
 
-        $cashiers = $shifts->map(function (Shift $cashierShift) use (&$allOrders) {
-            $orders = Order::where('restaurant_id', $cashierShift->restaurant_id)
-                ->where('shift_id', $cashierShift->id)
+        // Per-cashier breakdown: each user who created orders in this shift.
+        $allOrders = collect();
+        $cashierIds = Order::where('restaurant_id', $restaurantId)
+            ->where('shift_id', $shift->id)
+            ->whereNotNull('cashier_id')
+            ->distinct()
+            ->pluck('cashier_id')
+            ->map(fn ($id) => (int) $id)
+            ->values();
+
+        $cashiers = $cashierIds->map(function (int $cashierId) use ($shift, $restaurantId, &$allOrders) {
+            $cashier = User::where('id', $cashierId)->where('restaurant_id', $restaurantId)->first();
+            $orders = Order::where('restaurant_id', $restaurantId)
+                ->where('shift_id', $shift->id)
+                ->where('cashier_id', $cashierId)
                 ->where(function ($query) {
                     $query->where('payment_status', 'paid')->orWhere('status', 'completed');
                 })
@@ -854,7 +867,7 @@ class ShiftWorkflowController extends Controller
                     'payment_status' => $order->payment_status,
                     'table_name' => $order->table?->name,
                     'customer_name' => $order->customer?->name,
-                    'cashier_name' => $cashierShift->user?->name,
+                    'cashier_name' => $cashier?->name,
                     'items_count' => (int) $order->items->sum('quantity'),
                     'items' => $order->items->map(fn ($item) => [
                         'name' => $item->product?->name ?: $item->name,
@@ -870,14 +883,26 @@ class ShiftWorkflowController extends Controller
             }
 
             return [
-                'shift_id' => $cashierShift->id,
-                'user_id' => $cashierShift->user_id,
-                'user_name' => $cashierShift->user?->name,
+                'shift_id' => $shift->id,
+                'user_id' => $cashierId,
+                'user_name' => $cashier?->name,
                 'total' => round((float) array_sum($byPayment), 4),
                 'orders_count' => $orders->count(),
                 'by_payment_method' => array_map(fn ($amount) => round($amount, 4), $byPayment),
             ];
         })->values();
+
+        // If no orders exist yet, fall back to the opener so the report is not empty.
+        if ($cashiers->isEmpty()) {
+            $cashiers = collect([[
+                'shift_id' => $shift->id,
+                'user_id' => $shift->user_id,
+                'user_name' => $shift->user?->name,
+                'total' => 0.0,
+                'orders_count' => 0,
+                'by_payment_method' => [],
+            ]]);
+        }
 
         $byPayment = [];
         foreach ($cashiers as $cashier) {
@@ -886,18 +911,18 @@ class ShiftWorkflowController extends Controller
             }
         }
 
-        $shiftDates = $shifts->pluck('shift_date')
+        $shiftDates = collect([$shift->shift_date])
             ->filter()
-            ->map(fn ($date) => Carbon::parse($date)->toDateString())
+            ->map(fn ($date) => \Carbon\Carbon::parse($date)->toDateString())
             ->unique()
             ->values();
 
-        $expenses = Expense::where('restaurant_id', $shift->restaurant_id)
+        $expenses = \App\Models\Expense::where('restaurant_id', $restaurantId)
             ->whereIn(DB::raw('DATE(expense_date)'), $shiftDates->all())
             ->with('user')
             ->orderBy('expense_date')
             ->get()
-            ->map(fn (Expense $expense) => [
+            ->map(fn (\App\Models\Expense $expense) => [
                 'id' => $expense->id,
                 'category' => $expense->category,
                 'description' => $expense->description,
@@ -909,21 +934,20 @@ class ShiftWorkflowController extends Controller
 
         $ordersTotal = round((float) $cashiers->sum('total'), 4);
         $expensesTotal = round((float) $expenses->sum('amount'), 4);
-        $baseShift = $shifts->firstWhere('id', $shift->id) ?: $shift;
 
         return response()->json([
             'total' => $ordersTotal,
             'by_payment_method' => array_map(fn ($v) => round($v, 4), $byPayment),
             'orders_count' => $allOrders->count(),
-            'cashiers' => $cashiers,
+            'cashiers' => $cashiers->values(),
             'orders' => $allOrders->values(),
             'expenses' => $expenses,
             'expenses_total' => $expensesTotal,
             'net_total' => round($ordersTotal - $expensesTotal, 4),
-            'opening_cash' => (float) $baseShift->opening_cash,
-            'expected_cash' => (float) $baseShift->expected_cash,
-            'actual_cash' => (float) $baseShift->actual_cash,
-            'difference' => (float) $baseShift->difference,
+            'opening_cash' => (float) ($baseShift->opening_cash ?? 0),
+            'expected_cash' => (float) ($baseShift->expected_cash ?? 0),
+            'actual_cash' => (float) ($baseShift->actual_cash ?? 0),
+            'difference' => (float) ($baseShift->difference ?? 0),
         ]);
     }
 
