@@ -10,6 +10,7 @@ use App\Models\Expense;
 use App\Models\JournalEntry;
 use App\Models\Order;
 use App\Models\Payment;
+use App\Models\Setting;
 use App\Models\Shift;
 use App\Models\ShiftGroup;
 use App\Models\User;
@@ -593,48 +594,13 @@ class ShiftWorkflowController extends Controller
     {
         $user = $request->user();
         $restaurantId = $user->restaurant_id;
+
+        // The shift is shared by every POS user: a single open shift per restaurant.
         $shift = Shift::where('restaurant_id', $restaurantId)
-            ->where('user_id', $user->id)
             ->where('status', 'open')
             ->latest('id')
-            ->with('employees', 'employee')
+            ->with('employees', 'employee', 'user', 'group.employees')
             ->first();
-
-        if (! $shift && $user->hasPermissionTo('open_shift', 'sanctum')) {
-            $shift = DB::transaction(function () use ($user, $restaurantId) {
-                $group = ShiftGroup::where('restaurant_id', $restaurantId)
-                    ->where('status', 'open')
-                    ->latest('id')
-                    ->lockForUpdate()
-                    ->first();
-                if (! $group) {
-                    return null;
-                }
-
-                $existing = Shift::where('shift_group_id', $group->id)
-                    ->where('user_id', $user->id)
-                    ->where('status', 'open')
-                    ->first();
-                if ($existing) {
-                    return $existing;
-                }
-
-                return Shift::create([
-                    'restaurant_id' => $restaurantId,
-                    'shift_group_id' => $group->id,
-                    'user_id' => $user->id,
-                    'name' => $group->name,
-                    'shift_date' => $group->shift_date,
-                    'start_time' => now()->format('H:i:s'),
-                    'end_time' => '23:59:00',
-                    'status' => 'open',
-                    'opening_cash' => 0,
-                    'expected_cash' => 0,
-                    'actual_cash' => 0,
-                    'difference' => 0,
-                ]);
-            });
-        }
 
         if (! $shift) {
             return response()->json([
@@ -644,11 +610,14 @@ class ShiftWorkflowController extends Controller
             ]);
         }
 
+        $canViewAll = $user->hasPermissionTo('view_all_orders', 'sanctum')
+            || $user->hasPermissionTo('view_all_shifts', 'sanctum');
+
         $ordersQuery = Order::where('restaurant_id', $restaurantId)
-            ->where('shift_id', $shift->id)
-            ->where(function ($q) use ($user) {
-                $q->where('cashier_id', $user->id)->orWhereNull('cashier_id');
-            });
+            ->where('shift_id', $shift->id);
+        if (! $canViewAll) {
+            $ordersQuery->where('cashier_id', $user->id);
+        }
 
         $orders = $ordersQuery->where(function ($q) {
             $q->where('payment_status', 'paid')->orWhere('status', 'completed');
@@ -673,24 +642,21 @@ class ShiftWorkflowController extends Controller
         $byPayment = array_map(fn ($v) => round($v, 4), $byPayment);
 
         $groupEmployees = $shift->group?->employees()->get();
-        $hasOtherOpenShift = $shift->shift_group_id
-            ? Shift::where('shift_group_id', $shift->shift_group_id)
-                ->where('status', 'open')
-                ->where('id', '!=', $shift->id)
-                ->exists()
-            : false;
         if ($groupEmployees) {
             $shift->setRelation('employees', $groupEmployees);
         }
 
+        $canViewRevenue = $user->hasPermissionTo('view_pos', 'sanctum')
+            || $canViewAll;
+
         return response()->json([
             'shift' => $shift->load('user'),
-            'wage_disbursement_due' => ! $hasOtherOpenShift,
-            'revenue' => $user->hasPermissionTo('view_pos', 'sanctum') ? [
+            'wage_disbursement_due' => true,
+            'revenue' => $canViewRevenue ? [
                 'total' => round($total, 4),
                 'by_payment_method' => $byPayment,
             ] : null,
-            'orders_count' => $user->hasPermissionTo('view_pos', 'sanctum') ? $orders->count() : null,
+            'orders_count' => $canViewRevenue ? $orders->count() : null,
         ]);
     }
 
@@ -857,19 +823,23 @@ class ShiftWorkflowController extends Controller
         }
 
         $result = DB::transaction(function () use ($validated, $employeeIds, $restaurantId, $actor) {
+            // Only one open shift is allowed for the whole restaurant / POS.
+            $openShift = Shift::where('restaurant_id', $restaurantId)
+                ->where('status', 'open')
+                ->lockForUpdate()
+                ->first();
+            if ($openShift) {
+                throw ValidationException::withMessages([
+                    'shift' => ['يوجد وردية مفتوحة بالفعل. لا يمكن فتح وردية ثانية قبل إغلاقها.'],
+                ]);
+            }
+
             $group = ShiftGroup::where('restaurant_id', $restaurantId)
                 ->where('status', 'open')
                 ->latest('id')
                 ->lockForUpdate()
                 ->first();
-
-            if ($group) {
-                if ($employeeIds) {
-                    throw ValidationException::withMessages([
-                        'employee_ids' => ['لا يمكن تغيير موظفي الوردية بعد فتحها.'],
-                    ]);
-                }
-            } else {
+            if (! $group) {
                 $group = ShiftGroup::create([
                     'restaurant_id' => $restaurantId,
                     'opened_by' => $actor->id,
@@ -877,17 +847,10 @@ class ShiftWorkflowController extends Controller
                     'shift_date' => $validated['shift_date'],
                     'status' => 'open',
                 ]);
-                if ($employeeIds) {
-                    $group->employees()->sync($employeeIds);
-                }
             }
-
-            $group->forceFill([
-                'name' => 'وردية #'.$group->id.' - '.Carbon::parse($group->shift_date)->format('Y-m-d'),
-            ])->save();
+            $group->forceFill(['status' => 'open'])->save();
 
             $shift = Shift::where('shift_group_id', $group->id)
-                ->where('user_id', $actor->id)
                 ->where('status', 'open')
                 ->first();
             if (! $shift) {
@@ -895,8 +858,8 @@ class ShiftWorkflowController extends Controller
                     'restaurant_id' => $restaurantId,
                     'shift_group_id' => $group->id,
                     'user_id' => $actor->id,
-                    'name' => $group->name,
-                    'shift_date' => $group->shift_date,
+                    'name' => 'وردية #'.$group->id.' - '.Carbon::parse($validated['shift_date'])->format('Y-m-d'),
+                    'shift_date' => $validated['shift_date'],
                     'start_time' => Carbon::parse($validated['start_time'])->format('H:i:s'),
                     'end_time' => ! empty($validated['end_time'])
                         ? Carbon::parse($validated['end_time'])->format('H:i:s')
@@ -908,9 +871,15 @@ class ShiftWorkflowController extends Controller
                     'difference' => 0,
                     'notes' => $validated['notes'] ?? null,
                 ]);
-            } elseif ($shift->name !== $group->name) {
-                $shift->forceFill(['name' => $group->name])->save();
             }
+
+            if ($employeeIds) {
+                $group->employees()->sync($employeeIds);
+            }
+
+            $group->forceFill([
+                'name' => 'وردية #'.$group->id.' - '.Carbon::parse($group->shift_date)->format('Y-m-d'),
+            ])->save();
 
             $shift->setRelation('employees', $group->employees()->get());
 
@@ -921,7 +890,7 @@ class ShiftWorkflowController extends Controller
             'group' => $result['group']->load('employees'),
             'shift' => $result['shift'],
             'shifts' => $result['shifts']->values(),
-            'message' => 'تم فتح الوردية الجماعية، ويمكن لكل كاشير الانضمام من جهازه',
+            'message' => 'تم فتح الوردية، ويمكن لكل كاشير إنشاء الطلبات ضمنها',
         ], 201);
     }
 
@@ -940,21 +909,37 @@ class ShiftWorkflowController extends Controller
 
     public function update(Request $request, Shift $shift)
     {
-        abort_unless($shift->restaurant_id === $request->user()->restaurant_id, 403);
-        abort_unless(
-            (int) $shift->user_id === (int) $request->user()->id
-                || $request->user()->hasPermissionTo('view_all_shifts', 'sanctum'),
-            403
-        );
+        $user = $request->user();
+        abort_unless($shift->restaurant_id === $user->restaurant_id, 403);
+
         if ($request->input('status') === 'closed') {
-            abort_unless($request->user()->hasPermissionTo('close_shift', 'sanctum'), 403);
+            abort_unless($user->hasPermissionTo('close_shift', 'sanctum'), 403);
+
+            $closeAnyoneSetting = Setting::where('restaurant_id', $shift->restaurant_id)
+                ->where('group', 'pos')
+                ->where('key', 'close_shift_anyone')
+                ->value('value');
+            $closeAnyone = in_array(strtolower((string) $closeAnyoneSetting), ['true', '1', 'yes', 'on'], true);
+            $isOpener = (int) $shift->user_id === (int) $user->id
+                || ($shift->group && (int) $shift->group->opened_by === (int) $user->id);
+            if (! $closeAnyone && ! $isOpener) {
+                abort(403, 'فقط من فتح الوردية يمكنه إغلاقها. فعّل خيار السماح لأي مستخدم بإغلاق الوردية من الإعدادات للسماح بذلك.');
+            }
+        } else {
+            abort_unless(
+                (int) $shift->user_id === (int) $user->id
+                    || $user->hasPermissionTo('view_all_shifts', 'sanctum'),
+                403
+            );
         }
+
         $validated = $request->validate([
             'actual_cash' => 'sometimes|numeric|min:0',
             'status' => 'sometimes|in:open,closed',
             'notes' => 'sometimes|string',
             'end_time' => 'sometimes|date_format:H:i',
         ]);
+
         $journalCreated = false;
         if ($request->has('status') && $request->status === 'closed') {
             DB::transaction(function () use ($request, $shift, &$validated, &$journalCreated) {
@@ -993,22 +978,19 @@ class ShiftWorkflowController extends Controller
                     }
                 }
                 if (! empty($unpaidEmployees)) {
-                    $message = 'لا يمكن إغلاق الوردية قبل تسوية أجور الموظفين. الموظفون الذين لم تُسوى أجورهم: '
-                        .implode('، ', $unpaidEmployees);
+                    $names = implode('، ', $unpaidEmployees);
+                    $message = count($unpaidEmployees) === 1
+                        ? 'لا يمكن إغلاق الوردية قبل تسوية أجور الموظفين. تبقى الموظف '.$names.' لم يعطَ أجره.'
+                        : 'لا يمكن إغلاق الوردية قبل تسوية أجور الموظفين. تبقى الموظفون: '.$names.' لم يُعطَوا أجورهم.';
                     throw new HttpResponseException(response()->json([
                         'message' => $message,
                         'errors' => ['status' => [$message]],
                     ], 422));
                 }
 
-                $hasOtherOpenShift = $group
-                    ? Shift::where('shift_group_id', $group->id)
-                        ->where('status', 'open')
-                        ->where('id', '!=', $lockedShift->id)
-                        ->exists()
-                    : false;
-                $cashOrders = Order::where('restaurant_id', $shift->restaurant_id)
-                    ->where('shift_id', $shift->id)
+                $restaurantId = $lockedShift->restaurant_id;
+                $cashOrders = Order::where('restaurant_id', $restaurantId)
+                    ->where('shift_id', $lockedShift->id)
                     ->where(function ($q) {
                         $q->where('payment_status', 'paid')->orWhere('status', 'completed');
                     })
@@ -1024,19 +1006,19 @@ class ShiftWorkflowController extends Controller
                     : (float) $cashOrders
                         ->filter(fn ($order) => in_array(mb_strtolower(trim($order->payment_method ?: 'cash')), ['cash', 'نقد', 'نقدي', 'cashbox'], true))
                         ->sum('total_amount');
-                $expected = (float) ($shift->opening_cash ?? 0) + $cashRevenue;
+                $expected = (float) ($lockedShift->opening_cash ?? 0) + $cashRevenue;
                 $validated['expected_cash'] = round($expected, 4);
                 if ($request->has('actual_cash')) {
                     $validated['difference'] = round((float) $validated['actual_cash'] - $expected, 4);
                 }
+                $validated['status'] = 'closed';
                 $validated['closed_at'] = now();
                 if (empty($validated['end_time'])) {
                     $validated['end_time'] = now()->format('H:i:s');
                 }
 
-                $journalCreated = false;
-                // Auto-create journal entry for shift revenue, linked to accounts
-                $orders = Order::where('shift_id', $shift->id)
+                // Auto-create the shift journal entries (revenue + settlement).
+                $orders = Order::where('shift_id', $lockedShift->id)
                     ->where(function ($q) {
                         $q->where('payment_status', 'paid')->orWhere('status', 'completed');
                     })->get();
@@ -1053,8 +1035,7 @@ class ShiftWorkflowController extends Controller
                     }
                 }
 
-                $restaurantId = $shift->restaurant_id;
-                $cashier = User::where('id', $shift->user_id)
+                $cashier = User::where('id', $lockedShift->user_id)
                     ->where('restaurant_id', $restaurantId)
                     ->firstOrFail();
                 app(CashierAccountService::class)->ensureFor($cashier);
@@ -1089,9 +1070,9 @@ class ShiftWorkflowController extends Controller
                     $posting->post(
                         $restaurantId,
                         'SH-',
-                        'SHIFT-'.$shift->id,
-                        Carbon::parse($shift->shift_date)->toDateString(),
-                        'قيد إغلاق الوردية #'.$shift->id,
+                        'SHIFT-'.$lockedShift->id,
+                        Carbon::parse($lockedShift->shift_date)->toDateString(),
+                        'قيد إغلاق الوردية #'.$lockedShift->id,
                         $request->user()->id,
                         array_merge($lines, $settlementLines)
                     );
@@ -1101,17 +1082,36 @@ class ShiftWorkflowController extends Controller
                 if (isset($validated['end_time']) && is_string($validated['end_time']) && strlen($validated['end_time']) === 5) {
                     $validated['end_time'] .= ':00';
                 }
+
+                // Close the shared shift itself.
                 $lockedShift->update($validated);
-                if ($group && ! $group->shifts()->where('status', 'open')->exists()) {
-                    $group->update(['status' => 'closed']);
+
+                // Defensive: close any other leftovers in the same group.
+                if ($group) {
+                    Shift::where('shift_group_id', $group->id)
+                        ->where('status', 'open')
+                        ->where('id', '!=', $lockedShift->id)
+                        ->update([
+                            'status' => 'closed',
+                            'closed_at' => now(),
+                            'end_time' => now()->format('H:i:s'),
+                        ]);
+                    if (! Shift::where('shift_group_id', $group->id)->where('status', 'open')->exists()) {
+                        $group->update(['status' => 'closed']);
+                    }
                 }
             });
 
             return response()->json([
                 'shift' => $shift->fresh()->load('user'),
-                'message' => $journalCreated ? 'تم إغلاق الوردية وإنشاء قيود الوردية بنجاح' : 'تم إغلاق الوردية بنجاح',
+                'revenue' => null,
+                'message' => $journalCreated
+                    ? 'تم إغلاق الوردية وإنشاء قيود الوردية بنجاح'
+                    : 'تم إغلاق الوردية بنجاح',
             ]);
-        } elseif ($request->has('actual_cash')) {
+        }
+
+        if ($request->has('actual_cash')) {
             $expected = (float) ($shift->expected_cash ?? $shift->opening_cash ?? 0);
             $validated['difference'] = (float) $validated['actual_cash'] - $expected;
         }
@@ -1120,7 +1120,10 @@ class ShiftWorkflowController extends Controller
         }
         $shift->update($validated);
 
-        return response()->json(['shift' => $shift->fresh()->load('user'), 'message' => $journalCreated ? 'تم إغلاق الوردية وإنشاء قيود الوردية بنجاح' : 'تم إغلاق الوردية بنجاح']);
+        return response()->json([
+            'shift' => $shift->fresh()->load('user'),
+            'message' => 'تم تحديث الوردية',
+        ]);
     }
 
     public function destroy(Shift $shift)

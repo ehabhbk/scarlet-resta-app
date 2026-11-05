@@ -97,8 +97,8 @@ class OrderController extends Controller
             ->assertConfiguredPaymentMethod($restaurantId, $validated['payment_method']);
 
         return DB::transaction(function () use ($validated, $user, $restaurantId) {
+            // The shift is shared by all POS users: a single open shift per restaurant.
             $currentShift = Shift::where('restaurant_id', $restaurantId)
-                ->where('user_id', $user->id)
                 ->where('status', 'open')
                 ->latest('id')
                 ->lockForUpdate()
@@ -272,7 +272,8 @@ class OrderController extends Controller
                     'restaurant_id' => $restaurantId,
                     'paymentable_type' => Order::class,
                     'paymentable_id' => $order->id,
-                    'amount' => $amountPaid,
+                    // Revenue is the order total; any surplus is change handed back.
+                    'amount' => min((float) $amountPaid, (float) $totalAmount),
                     'method' => $validated['payment_method'],
                     'reference' => null,
                     'transaction_id' => null,
