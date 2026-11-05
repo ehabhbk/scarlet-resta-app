@@ -58,6 +58,7 @@ return [
         'view_all_kitchen_orders' => 'عرض جميع طلبات المطبخ',
         'view_station_kitchen_orders' => 'عرض طلبات محطة المطبخ',
         'update_kitchen_order' => 'تحديث حالة طلب المطبخ',
+        'manage_kitchen_products' => 'إدارة منتجات المطبخ',
     ],
     'المخزون والمشتريات والموردون' => [
         'create_inventory' => 'إضافة صنف مخزون',

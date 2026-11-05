@@ -313,8 +313,7 @@ class KitchenController extends Controller
             abort_unless($user->kitchen_station_id && (int) $product->kitchen_station_id === (int) $user->kitchen_station_id, 403);
         }
         abort_unless(
-            $user->hasPermissionTo('update_kitchen_order', 'sanctum')
-                || $user->hasPermissionTo('edit_products', 'sanctum'),
+            $user->hasPermissionTo('manage_kitchen_products', 'sanctum'),
             403
         );
 
