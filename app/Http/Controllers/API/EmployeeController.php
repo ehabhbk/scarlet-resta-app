@@ -667,6 +667,7 @@ class ShiftWorkflowController extends Controller
             'opening_cash' => round($opening, 4),
             'opening_cash_set' => (bool) $balance->opening_cash_set,
             'revenue' => $summary['total'],
+            'by_payment_method' => $summary['by_payment_method'],
             'cash_revenue' => $summary['cash'],
             'expected_cash' => round($opening + $summary['cash'], 4),
             'actual_cash' => $balance->actual_cash !== null ? round((float) $balance->actual_cash, 4) : null,
