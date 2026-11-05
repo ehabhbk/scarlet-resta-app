@@ -7,6 +7,7 @@ use App\Models\Order;
 use App\Models\OrderItem;
 use App\Models\OrderKitchenStation;
 use App\Models\KitchenStation;
+use App\Models\Product;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Carbon\Carbon;
@@ -278,5 +279,54 @@ class KitchenController extends Controller
         return $user->hasPermissionTo('view_all_kitchen_orders', 'sanctum')
             || ($user->hasPermissionTo('view_kitchen', 'sanctum')
                 && ! $user->hasPermissionTo('view_station_kitchen_orders', 'sanctum'));
+    }
+
+    public function products(Request $request)
+    {
+        $user = $request->user();
+        $restaurantId = $user->restaurant_id;
+        $canViewAll = $this->canViewAllOrders($user);
+        abort_unless(
+            $canViewAll || ($user->hasPermissionTo('view_station_kitchen_orders', 'sanctum') && $user->kitchen_station_id)
+                || $user->hasPermissionTo('update_kitchen_order', 'sanctum'),
+            403
+        );
+
+        $stationId = $canViewAll ? $request->query('station_id') : $user->kitchen_station_id;
+
+        $query = Product::where('restaurant_id', $restaurantId);
+        if ($stationId) {
+            $query->where('kitchen_station_id', $stationId);
+        }
+
+        return response()->json([
+            'products' => $query->orderBy('name')->get(['id', 'name', 'image', 'sale_price', 'is_available', 'kitchen_station_id']),
+        ]);
+    }
+
+    public function updateProductAvailability(Request $request, Product $product)
+    {
+        $user = $request->user();
+        abort_unless($product->restaurant_id === $user->restaurant_id, 403);
+        $canViewAll = $this->canViewAllOrders($user);
+        if (! $canViewAll) {
+            abort_unless($user->kitchen_station_id && (int) $product->kitchen_station_id === (int) $user->kitchen_station_id, 403);
+        }
+        abort_unless(
+            $user->hasPermissionTo('update_kitchen_order', 'sanctum')
+                || $user->hasPermissionTo('edit_products', 'sanctum'),
+            403
+        );
+
+        $validated = $request->validate([
+            'is_available' => 'required|boolean',
+        ]);
+
+        $product->update(['is_available' => $validated['is_available']]);
+
+        return response()->json([
+            'product' => $product->fresh(),
+            'message' => $validated['is_available'] ? 'تم تفعيل المنتج' : 'تم تعطيل المنتج (نفذ)',
+        ]);
     }
 }

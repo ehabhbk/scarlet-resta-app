@@ -98,6 +98,8 @@ Route::middleware(['auth:sanctum', 'audit', 'api.permission:kitchen'])->prefix('
     Route::post('order-items/{orderItem}/status', [\App\Http\Controllers\API\KitchenController::class, 'updateItemStatus']);
     Route::post('order-items/{orderItem}/start-timer', [\App\Http\Controllers\API\KitchenController::class, 'startTimer']);
     Route::post('order-items/{orderItem}/complete-timer', [\App\Http\Controllers\API\KitchenController::class, 'completeTimer']);
+    Route::get('products', [\App\Http\Controllers\API\KitchenController::class, 'products']);
+    Route::put('products/{product}/availability', [\App\Http\Controllers\API\KitchenController::class, 'updateProductAvailability']);
 });
 
 // Inventory
