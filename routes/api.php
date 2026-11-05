@@ -147,7 +147,8 @@ Route::middleware(['auth:sanctum', 'audit', 'api.permission:reports'])->prefix('
 });
 
 // Settings
-Route::middleware(['auth:sanctum', 'audit', 'api.permission:settings'])->apiResource('settings', \App\Http\Controllers\API\SettingController::class);
+Route::middleware(['auth:sanctum', 'audit'])->get('settings', [\App\Http\Controllers\API\SettingController::class, 'index']);
+Route::middleware(['auth:sanctum', 'audit', 'api.permission:settings'])->apiResource('settings', \App\Http\Controllers\API\SettingController::class)->except(['index']);
 
 // Notifications
 Route::middleware(['auth:sanctum', 'audit', 'api.permission:notifications'])->prefix('notifications')->group(function () {
