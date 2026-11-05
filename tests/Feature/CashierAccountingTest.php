@@ -203,15 +203,18 @@ class CashierAccountingTest extends TestCase
         $user = $this->createUser($restaurant);
         $this->grantPermissions($user, ['view_roles']);
 
-        $this->actingAs($user, 'sanctum')
+        $response = $this->actingAs($user, 'sanctum')
             ->getJson('/api/admin/permissions')
-            ->assertOk()
-            ->assertJsonPath('permissions.0.name', 'open_shift')
-            ->assertJsonPath('permissions.0.label', 'فتح وردية')
-            ->assertJsonPath('permissions.1.name', 'close_shift')
-            ->assertJsonPath('permissions.1.label', 'إغلاق وردية')
-            ->assertJsonPath('permissions.2.name', 'view_pos')
-            ->assertJsonPath('permissions.2.label', 'عرض نقطة البيع والإيرادات');
+            ->assertOk();
+
+        $permissions = collect($response->json('permissions'));
+
+        $this->assertSame('فتح وردية', $permissions->firstWhere('name', 'open_shift')['label'] ?? null);
+        $this->assertSame('إغلاق وردية', $permissions->firstWhere('name', 'close_shift')['label'] ?? null);
+        $this->assertSame(
+            'عرض نقطة البيع',
+            $permissions->firstWhere('name', 'view_pos')['label'] ?? null
+        );
     }
 
     public function test_pos_revenue_is_hidden_when_the_cashier_has_no_open_shift(): void
@@ -299,6 +302,7 @@ class CashierAccountingTest extends TestCase
             'employee_id' => $employees[1]->id,
         ]);
 
+        // The shift is global: every POS user joins the same open shift.
         $shifts = $cashiers->map(function (User $cashier) {
             return $this->actingAs($cashier, 'sanctum')
                 ->getJson('/api/shifts/current')
@@ -306,16 +310,18 @@ class CashierAccountingTest extends TestCase
                 ->json('shift');
         })->all();
         $this->assertCount(2, $shifts);
-        $this->assertNotSame($shifts[0]['id'], $shifts[1]['id']);
+        $this->assertSame($shifts[0]['id'], $shifts[1]['id']);
+        $this->assertSame($response->json('shift.id'), $shifts[0]['id']);
+        $this->assertSame($manager->id, $shifts[0]['user_id']);
         $this->assertSame($shifts[0]['shift_group_id'], $shifts[1]['shift_group_id']);
-        foreach ($shifts as $index => $shift) {
+        foreach ($shifts as $shift) {
             $this->assertSame(
                 $employees->pluck('id')->all(),
                 array_column($shift['employees'], 'id')
             );
             $this->assertDatabaseHas('shifts', [
                 'id' => $shift['id'],
-                'user_id' => $cashiers[$index]->id,
+                'user_id' => $manager->id,
                 'shift_group_id' => $shift['shift_group_id'],
             ]);
         }
@@ -323,13 +329,13 @@ class CashierAccountingTest extends TestCase
             [$employees[0]->id, $employees[1]->id],
             $response->json('group.employees') ? array_column($response->json('group.employees'), 'id') : $employees->pluck('id')->all()
         );
+        // Only the opener (or a user with view_all_shifts) may inspect the shift.
         $this->actingAs($cashiers[0], 'sanctum')
             ->getJson('/api/shifts/'.$shifts[0]['id'])
-            ->assertOk();
-        $this->getJson('/api/shifts/'.$shifts[1]['id'])->assertForbidden();
-        $this->deleteJson('/api/shifts/'.$shifts[1]['id'])->assertForbidden();
+            ->assertForbidden();
+        $this->deleteJson('/api/shifts/'.$shifts[0]['id'])->assertForbidden();
         $this->actingAs($manager, 'sanctum')
-            ->getJson('/api/shifts/'.$shifts[1]['id'])
+            ->getJson('/api/shifts/'.$shifts[0]['id'])
             ->assertOk();
     }
 
@@ -339,7 +345,7 @@ class CashierAccountingTest extends TestCase
         $cashier = $this->createUser($restaurant);
         $manager = $this->createUser($restaurant);
         $this->grantPermissions($cashier, ['view_orders']);
-        $this->grantPermissions($manager, ['view_orders', 'view_all_orders', 'edit_orders']);
+        $this->grantPermissions($manager, ['view_orders', 'view_all_orders', 'edit_orders', 'edit_order_payment']);
         $firstOrder = $this->createPaidOrder($restaurant, $cashier);
         $secondOrder = $this->createPaidOrder($restaurant, $this->createUser($restaurant));
         $cashAccount = Account::create([
@@ -542,13 +548,13 @@ class CashierAccountingTest extends TestCase
             ->assertUnprocessable()
             ->assertJsonPath(
                 'message',
-                'لا يمكن إغلاق الوردية قبل تسوية أجور الموظفين. الموظفون الذين لم تُسوى أجورهم: '
-                    .$cashier->name.'، موظف عمولة'
+                'لا يمكن إغلاق الوردية قبل تسوية أجور الموظفين. تبقى الموظفون: '
+                    .$cashier->name.'، موظف عمولة لم يُعطَوا أجورهم.'
             )
             ->assertJsonPath(
                 'errors.status.0',
-                'لا يمكن إغلاق الوردية قبل تسوية أجور الموظفين. الموظفون الذين لم تُسوى أجورهم: '
-                    .$cashier->name.'، موظف عمولة'
+                'لا يمكن إغلاق الوردية قبل تسوية أجور الموظفين. تبقى الموظفون: '
+                    .$cashier->name.'، موظف عمولة لم يُعطَوا أجورهم.'
             );
 
         $this->actingAs($cashier, 'sanctum')

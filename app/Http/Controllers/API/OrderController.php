@@ -481,15 +481,63 @@ class OrderController extends Controller
                     ?? $singlePaymentMethod
                     ?? $order->payment_method;
             } else {
-                $amountPaid = (float) $order->amount_paid;
+                $method = $singlePaymentMethod ?? $order->payment_method ?? 'cash';
 
-                // Allow callers to move the recorded paid amount explicitly. A
-                // positive difference creates a new payment row so the revenue
-                // breakdown stays accurate; existing rows are never mutated.
-                if ($amountReceived !== null) {
+                // Changing only the payment method should move the recorded
+                // payment rows too, not just the order column.
+                if ($singlePaymentMethod !== null) {
+                    app(JournalPostingService::class)
+                        ->assertConfiguredPaymentMethod($order->restaurant_id, $singlePaymentMethod);
+                    Payment::where('paymentable_type', Order::class)
+                        ->where('paymentable_id', $order->id)
+                        ->where('amount', '>', 0)
+                        ->update(['method' => $singlePaymentMethod, 'updated_at' => now()]);
+                    $updates['payment_method'] = $singlePaymentMethod;
+                }
+
+                $amountPaid = (float) $order->amount_paid;
+                $netPaid = max(0, $amountPaid - (float) $order->change_due);
+
+                if (isset($validated['items'])) {
+                    // Item replacement can refund a surplus or collect the
+                    // difference between the old and the new total.
+                    if ($netPaid > $total) {
+                        Payment::create([
+                            'restaurant_id' => $order->restaurant_id,
+                            'paymentable_type' => Order::class,
+                            'paymentable_id' => $order->id,
+                            'amount' => -round($netPaid - $total, 2),
+                            'method' => $method,
+                            'reference' => null,
+                            'transaction_id' => null,
+                            'paid_at' => now(),
+                            'user_id' => $request->user()->id,
+                            'notes' => 'استرداد فرق تعديل أصناف الطلب',
+                        ]);
+                        $amountPaid = $total;
+                    } elseif ($netPaid < $total && $amountReceived !== null && $amountReceived > 0) {
+                        Payment::create([
+                            'restaurant_id' => $order->restaurant_id,
+                            'paymentable_type' => Order::class,
+                            'paymentable_id' => $order->id,
+                            'amount' => $amountReceived,
+                            'method' => $method,
+                            'reference' => null,
+                            'transaction_id' => null,
+                            'paid_at' => now(),
+                            'user_id' => $request->user()->id,
+                            'notes' => 'دفعة فرق تعديل أصناف الطلب',
+                        ]);
+                        $amountPaid = $netPaid + $amountReceived;
+                    } else {
+                        $amountPaid = $netPaid;
+                    }
+                } elseif ($amountReceived !== null) {
+                    // Allow callers to move the recorded paid amount explicitly. A
+                    // positive difference creates a new payment row so the revenue
+                    // breakdown stays accurate; existing rows are never mutated.
                     $delta = round($amountReceived - $amountPaid, 2);
                     if ($delta > 0) {
-                        $method = $singlePaymentMethod ?? $order->payment_method ?? 'cash';
                         app(JournalPostingService::class)
                             ->assertConfiguredPaymentMethod($order->restaurant_id, $method);
                         Payment::create([

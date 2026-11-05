@@ -44,10 +44,12 @@ class OrderWorkflowTest extends TestCase
             'view_all_orders',
             'create_orders',
             'edit_orders',
+            'edit_order_payment',
             'delete_orders',
             'cancel_orders',
             'refund_orders',
             'update_kitchen_order',
+            'view_all_kitchen_orders',
         ];
         $permissions = collect($permissionNames)->map(fn (string $name) => Permission::firstOrCreate([
             'name' => $name,
