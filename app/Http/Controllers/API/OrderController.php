@@ -17,6 +17,7 @@ use App\Models\Product;
 use App\Models\ProductModifier;
 use App\Models\Recipe;
 use App\Models\Shift;
+use App\Models\ShiftCashierBalance;
 use App\Models\StockMovement;
 use App\Models\Table;
 use App\Services\JournalPostingService;
@@ -111,6 +112,16 @@ class OrderController extends Controller
                     'errors' => ['shift' => [$message]],
                 ], 422));
             }
+
+            // Every cashier keeps their own opening cash/revenue inside the shared shift.
+            ShiftCashierBalance::firstOrCreate(
+                ['shift_id' => $currentShift->id, 'user_id' => $user->id],
+                [
+                    'restaurant_id' => $restaurantId,
+                    'opening_cash' => 0,
+                    'opening_cash_set' => false,
+                ]
+            );
 
             $orderNumber = $this->nextOrderNumber();
 

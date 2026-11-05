@@ -124,6 +124,7 @@ Route::middleware(['auth:sanctum', 'audit'])->post('shifts/open', [\App\Http\Con
 Route::middleware(['auth:sanctum', 'audit'])->get('shifts/{shift}/employee-wages', [\App\Http\Controllers\API\ShiftController::class, 'employeeWages']);
 Route::middleware(['auth:sanctum', 'audit'])->post('shifts/{shift}/employee-wages', [\App\Http\Controllers\API\ShiftController::class, 'payEmployeeWage']);
 Route::middleware(['auth:sanctum', 'audit'])->get('shifts/{shift}/revenue', [\App\Http\Controllers\API\ShiftController::class, 'revenue']);
+Route::middleware(['auth:sanctum', 'audit'])->post('shifts/{shift}/opening-cash', [\App\Http\Controllers\API\ShiftController::class, 'setOpeningCash']);
 Route::middleware(['auth:sanctum', 'audit'])->apiResource('shifts', \App\Http\Controllers\API\ShiftController::class);
 
 // Finance

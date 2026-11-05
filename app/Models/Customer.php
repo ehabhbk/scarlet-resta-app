@@ -184,4 +184,9 @@ class Shift extends Model
     {
         return $this->belongsTo(ShiftGroup::class, 'shift_group_id');
     }
+
+    public function cashierBalances()
+    {
+        return $this->hasMany(ShiftCashierBalance::class);
+    }
 }

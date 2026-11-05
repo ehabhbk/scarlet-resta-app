@@ -12,6 +12,7 @@ use App\Models\Order;
 use App\Models\Payment;
 use App\Models\Setting;
 use App\Models\Shift;
+use App\Models\ShiftCashierBalance;
 use App\Models\ShiftGroup;
 use App\Models\User;
 use App\Services\CashierAccountService;
@@ -590,6 +591,91 @@ class ShiftWorkflowController extends Controller
             && $user->hasPermissionTo($permission, 'sanctum');
     }
 
+    private function closeAnyoneEnabled(int $restaurantId): bool
+    {
+        $value = Setting::where('restaurant_id', $restaurantId)
+            ->where('group', 'pos')
+            ->where('key', 'close_shift_anyone')
+            ->value('value');
+
+        return in_array(strtolower((string) $value), ['true', '1', 'yes', 'on'], true);
+    }
+
+    private function canCloseShift(User $user, Shift $shift): bool
+    {
+        $isOpener = (int) $shift->user_id === (int) $user->id
+            || ($shift->group && (int) $shift->group->opened_by === (int) $user->id);
+        if ($isOpener) {
+            return true;
+        }
+
+        return $user->hasPermissionTo('close_shift', 'sanctum')
+            && $this->closeAnyoneEnabled((int) $shift->restaurant_id);
+    }
+
+    /**
+     * @return array{orders_count:int,total:float,by_payment_method:array<string,float>,cash:float}
+     */
+    private function revenueSummary(Shift $shift, ?int $userId = null): array
+    {
+        $query = Order::where('restaurant_id', $shift->restaurant_id)
+            ->where('shift_id', $shift->id)
+            ->where(function ($q) {
+                $q->where('payment_status', 'paid')->orWhere('status', 'completed');
+            });
+        if ($userId !== null) {
+            $query->where('cashier_id', $userId);
+        }
+
+        $orders = $query->with('payments')->get();
+        $byPayment = [];
+        foreach ($orders as $order) {
+            foreach ($order->payments as $payment) {
+                $method = $payment->method ?: 'cash';
+                $byPayment[$method] = ($byPayment[$method] ?? 0) + (float) $payment->amount;
+            }
+            if ($order->payments->isEmpty()) {
+                $method = $order->payment_method ?: 'cash';
+                $byPayment[$method] = ($byPayment[$method] ?? 0) + (float) $order->total_amount;
+            }
+        }
+        $byPayment = array_map(fn ($value) => round((float) $value, 4), $byPayment);
+
+        $cash = 0.0;
+        foreach ($byPayment as $method => $amount) {
+            if (in_array(mb_strtolower(trim((string) $method)), ['cash', 'نقد', 'نقدي', 'cashbox'], true)) {
+                $cash += (float) $amount;
+            }
+        }
+
+        return [
+            'orders_count' => $orders->count(),
+            'total' => round((float) array_sum($byPayment), 4),
+            'by_payment_method' => $byPayment,
+            'cash' => round($cash, 4),
+        ];
+    }
+
+    private function cashierBalancePayload(Shift $shift, ShiftCashierBalance $balance): array
+    {
+        $summary = $this->revenueSummary($shift, (int) $balance->user_id);
+        $opening = (float) $balance->opening_cash;
+
+        return [
+            'user_id' => (int) $balance->user_id,
+            'user_name' => $balance->user?->name,
+            'opening_cash' => round($opening, 4),
+            'opening_cash_set' => (bool) $balance->opening_cash_set,
+            'revenue' => $summary['total'],
+            'cash_revenue' => $summary['cash'],
+            'expected_cash' => round($opening + $summary['cash'], 4),
+            'actual_cash' => $balance->actual_cash !== null ? round((float) $balance->actual_cash, 4) : null,
+            'difference' => $balance->difference !== null ? round((float) $balance->difference, 4) : null,
+            'orders_count' => $summary['orders_count'],
+            'closed_at' => $balance->closed_at?->toISOString(),
+        ];
+    }
+
     public function current(Request $request)
     {
         $user = $request->user();
@@ -607,58 +693,112 @@ class ShiftWorkflowController extends Controller
                 'shift' => null,
                 'revenue' => null,
                 'orders_count' => null,
+                'balance' => null,
+                'needs_opening_cash' => false,
+                'can_close_shift' => false,
             ]);
         }
 
         $canViewAll = $user->hasPermissionTo('view_all_orders', 'sanctum')
             || $user->hasPermissionTo('view_all_shifts', 'sanctum');
-
-        $ordersQuery = Order::where('restaurant_id', $restaurantId)
-            ->where('shift_id', $shift->id);
-        if (! $canViewAll) {
-            $ordersQuery->where('cashier_id', $user->id);
-        }
-
-        $orders = $ordersQuery->where(function ($q) {
-            $q->where('payment_status', 'paid')->orWhere('status', 'completed');
-        })->get();
-
-        $total = $orders->sum(fn ($o) => (float) $o->total_amount);
-        $orderIds = $orders->pluck('id');
-        $payments = Payment::where('paymentable_type', Order::class)
-            ->whereIn('paymentable_id', $orderIds)
-            ->get();
-        $byPayment = [];
-        foreach ($payments as $payment) {
-            $method = $payment->method ?: 'cash';
-            $byPayment[$method] = ($byPayment[$method] ?? 0) + (float) $payment->amount;
-        }
-        if (empty($byPayment)) {
-            foreach ($orders as $order) {
-                $method = $order->payment_method ?: 'cash';
-                $byPayment[$method] = ($byPayment[$method] ?? 0) + (float) $order->total_amount;
-            }
-        }
-        $byPayment = array_map(fn ($v) => round($v, 4), $byPayment);
+        $canViewRevenue = $user->hasPermissionTo('view_pos', 'sanctum') || $canViewAll;
+        $canClose = $this->canCloseShift($user, $shift);
 
         $groupEmployees = $shift->group?->employees()->get();
         if ($groupEmployees) {
             $shift->setRelation('employees', $groupEmployees);
         }
 
-        $canViewRevenue = $user->hasPermissionTo('view_pos', 'sanctum')
-            || $canViewAll;
+        $mySummary = $this->revenueSummary($shift, (int) $user->id);
+        $myBalance = ShiftCashierBalance::where('shift_id', $shift->id)
+            ->where('user_id', $user->id)
+            ->first();
+        $opening = $myBalance ? (float) $myBalance->opening_cash : 0.0;
 
-        return response()->json([
+        $response = [
             'shift' => $shift->load('user'),
             'wage_disbursement_due' => true,
             'revenue' => $canViewRevenue ? [
-                'total' => round($total, 4),
-                'by_payment_method' => $byPayment,
+                'total' => $mySummary['total'],
+                'by_payment_method' => $mySummary['by_payment_method'],
             ] : null,
-            'orders_count' => $canViewRevenue ? $orders->count() : null,
+            'orders_count' => $canViewRevenue ? $mySummary['orders_count'] : null,
+            'balance' => [
+                'user_id' => (int) $user->id,
+                'user_name' => $user->name,
+                'opening_cash' => round($opening, 4),
+                'opening_cash_set' => (bool) ($myBalance?->opening_cash_set ?? false),
+                'revenue' => $mySummary['total'],
+                'cash_revenue' => $mySummary['cash'],
+                'expected_cash' => round($opening + $mySummary['cash'], 4),
+                'actual_cash' => $myBalance?->actual_cash !== null ? round((float) $myBalance->actual_cash, 4) : null,
+                'difference' => $myBalance?->difference !== null ? round((float) $myBalance->difference, 4) : null,
+                'orders_count' => $mySummary['orders_count'],
+                'closed_at' => $myBalance?->closed_at?->toISOString(),
+            ],
+            'needs_opening_cash' => $user->hasPermissionTo('create_orders', 'sanctum')
+                && ! (bool) ($myBalance?->opening_cash_set ?? false),
+            'can_close_shift' => $canClose,
+        ];
+
+        if ($canViewAll || $canClose) {
+            $balances = ShiftCashierBalance::where('shift_id', $shift->id)
+                ->with('user')
+                ->get()
+                ->map(fn (ShiftCashierBalance $balance) => $this->cashierBalancePayload($shift, $balance))
+                ->values();
+            $shiftSummary = $this->revenueSummary($shift);
+            $response['cashiers'] = $balances;
+            $response['shift_revenue'] = [
+                'total' => $shiftSummary['total'],
+                'by_payment_method' => $shiftSummary['by_payment_method'],
+            ];
+            $response['shift_orders_count'] = $shiftSummary['orders_count'];
+        }
+
+        return response()->json($response);
+    }
+
+    public function setOpeningCash(Request $request, Shift $shift)
+    {
+        $user = $request->user();
+        abort_unless($shift->restaurant_id === $user->restaurant_id, 403);
+        abort_unless($user->hasPermissionTo('create_orders', 'sanctum'), 403);
+
+        $validated = $request->validate([
+            'opening_cash' => 'required|numeric|min:0',
+        ]);
+
+        $balance = DB::transaction(function () use ($shift, $user, $validated) {
+            $lockedShift = Shift::whereKey($shift->id)->lockForUpdate()->firstOrFail();
+            if ($lockedShift->status !== 'open') {
+                throw ValidationException::withMessages([
+                    'shift' => ['لا يمكن تحديد النقد الافتتاحي لوردية مغلقة.'],
+                ]);
+            }
+
+            $balance = ShiftCashierBalance::firstOrCreate(
+                ['shift_id' => $lockedShift->id, 'user_id' => $user->id],
+                [
+                    'restaurant_id' => $lockedShift->restaurant_id,
+                    'opening_cash' => 0,
+                    'opening_cash_set' => false,
+                ]
+            );
+            $balance->update([
+                'opening_cash' => round((float) $validated['opening_cash'], 4),
+                'opening_cash_set' => true,
+            ]);
+
+            return $balance;
+        });
+
+        return response()->json([
+            'balance' => $this->cashierBalancePayload($shift->fresh(), $balance->load('user')),
+            'message' => 'تم حفظ النقد الافتتاحي الخاص بك',
         ]);
     }
+
 
     public function revenue(Request $request, Shift $shift)
     {
@@ -873,6 +1013,17 @@ class ShiftWorkflowController extends Controller
                 ]);
             }
 
+            // Each user keeps their own opening cash inside the shared shift.
+            $openingCash = round((float) ($validated['opening_cash'] ?? 0), 4);
+            ShiftCashierBalance::updateOrCreate(
+                ['shift_id' => $shift->id, 'user_id' => $actor->id],
+                [
+                    'restaurant_id' => $restaurantId,
+                    'opening_cash' => $openingCash,
+                    'opening_cash_set' => true,
+                ]
+            );
+
             if ($employeeIds) {
                 $group->employees()->sync($employeeIds);
             }
@@ -894,6 +1045,7 @@ class ShiftWorkflowController extends Controller
         ], 201);
     }
 
+
     public function show(Shift $shift)
     {
         $user = auth()->user();
@@ -913,17 +1065,13 @@ class ShiftWorkflowController extends Controller
         abort_unless($shift->restaurant_id === $user->restaurant_id, 403);
 
         if ($request->input('status') === 'closed') {
-            abort_unless($user->hasPermissionTo('close_shift', 'sanctum'), 403);
-
-            $closeAnyoneSetting = Setting::where('restaurant_id', $shift->restaurant_id)
-                ->where('group', 'pos')
-                ->where('key', 'close_shift_anyone')
-                ->value('value');
-            $closeAnyone = in_array(strtolower((string) $closeAnyoneSetting), ['true', '1', 'yes', 'on'], true);
             $isOpener = (int) $shift->user_id === (int) $user->id
                 || ($shift->group && (int) $shift->group->opened_by === (int) $user->id);
-            if (! $closeAnyone && ! $isOpener) {
-                abort(403, 'فقط من فتح الوردية يمكنه إغلاقها. فعّل خيار السماح لأي مستخدم بإغلاق الوردية من الإعدادات للسماح بذلك.');
+            if (! $isOpener) {
+                abort_unless($user->hasPermissionTo('close_shift', 'sanctum'), 403);
+                if (! $this->closeAnyoneEnabled((int) $shift->restaurant_id)) {
+                    abort(403, 'فقط من فتح الوردية يمكنه إغلاقها. فعّل خيار السماح لأي مستخدم بإغلاق الوردية من الإعدادات للسماح بذلك.');
+                }
             }
         } else {
             abort_unless(
@@ -935,6 +1083,9 @@ class ShiftWorkflowController extends Controller
 
         $validated = $request->validate([
             'actual_cash' => 'sometimes|numeric|min:0',
+            'cashiers' => 'sometimes|array',
+            'cashiers.*.user_id' => 'required|integer',
+            'cashiers.*.actual_cash' => 'required|numeric|min:0',
             'status' => 'sometimes|in:open,closed',
             'notes' => 'sometimes|string',
             'end_time' => 'sometimes|date_format:H:i',
@@ -942,7 +1093,7 @@ class ShiftWorkflowController extends Controller
 
         $journalCreated = false;
         if ($request->has('status') && $request->status === 'closed') {
-            DB::transaction(function () use ($request, $shift, &$validated, &$journalCreated) {
+            DB::transaction(function () use ($request, $user, $shift, &$validated, &$journalCreated) {
                 $lockedShift = Shift::whereKey($shift->id)->lockForUpdate()->firstOrFail();
                 if ($lockedShift->status !== 'open') {
                     throw ValidationException::withMessages([
@@ -989,57 +1140,37 @@ class ShiftWorkflowController extends Controller
                 }
 
                 $restaurantId = $lockedShift->restaurant_id;
-                $cashOrders = Order::where('restaurant_id', $restaurantId)
+
+                // Make sure every user who worked in this shift has their own balance row.
+                $cashierIds = Order::where('restaurant_id', $restaurantId)
                     ->where('shift_id', $lockedShift->id)
-                    ->where(function ($q) {
-                        $q->where('payment_status', 'paid')->orWhere('status', 'completed');
-                    })
-                    ->get();
-                $cashOrderIds = $cashOrders->pluck('id');
-                $cashPayments = Payment::where('paymentable_type', Order::class)
-                    ->whereIn('paymentable_id', $cashOrderIds)
-                    ->get();
-                $cashRevenue = $cashPayments->isNotEmpty()
-                    ? (float) $cashPayments
-                        ->filter(fn ($payment) => in_array(mb_strtolower(trim($payment->method ?: 'cash')), ['cash', 'نقد', 'نقدي', 'cashbox'], true))
-                        ->sum('amount')
-                    : (float) $cashOrders
-                        ->filter(fn ($order) => in_array(mb_strtolower(trim($order->payment_method ?: 'cash')), ['cash', 'نقد', 'نقدي', 'cashbox'], true))
-                        ->sum('total_amount');
-                $expected = (float) ($lockedShift->opening_cash ?? 0) + $cashRevenue;
-                $validated['expected_cash'] = round($expected, 4);
-                if ($request->has('actual_cash')) {
-                    $validated['difference'] = round((float) $validated['actual_cash'] - $expected, 4);
-                }
-                $validated['status'] = 'closed';
-                $validated['closed_at'] = now();
-                if (empty($validated['end_time'])) {
-                    $validated['end_time'] = now()->format('H:i:s');
+                    ->whereNotNull('cashier_id')
+                    ->distinct()
+                    ->pluck('cashier_id')
+                    ->map(fn ($id) => (int) $id)
+                    ->all();
+                $cashierIds[] = (int) $lockedShift->user_id;
+                foreach (array_unique($cashierIds) as $cashierId) {
+                    $isOpener = $cashierId === (int) $lockedShift->user_id;
+                    ShiftCashierBalance::firstOrCreate(
+                        ['shift_id' => $lockedShift->id, 'user_id' => $cashierId],
+                        [
+                            'restaurant_id' => $restaurantId,
+                            'opening_cash' => $isOpener ? (float) ($lockedShift->opening_cash ?? 0) : 0,
+                            'opening_cash_set' => $isOpener,
+                        ]
+                    );
                 }
 
-                // Auto-create the shift journal entries (revenue + settlement).
-                $orders = Order::where('shift_id', $lockedShift->id)
-                    ->where(function ($q) {
-                        $q->where('payment_status', 'paid')->orWhere('status', 'completed');
-                    })->get();
-                $orderIds = $orders->pluck('id');
-                $payments = Payment::where('paymentable_type', Order::class)
-                    ->whereIn('paymentable_id', $orderIds)->get();
-                $byPayment = [];
-                foreach ($payments as $p) {
-                    $byPayment[$p->method ?: 'cash'] = ($byPayment[$p->method ?: 'cash'] ?? 0) + (float) $p->amount;
-                }
-                if (empty($byPayment)) {
-                    foreach ($orders as $o) {
-                        $byPayment[$o->payment_method ?: 'cash'] = ($byPayment[$o->payment_method ?: 'cash'] ?? 0) + (float) $o->total_amount;
-                    }
+                $balances = ShiftCashierBalance::where('shift_id', $lockedShift->id)
+                    ->with('user')
+                    ->get();
+
+                $actualByUser = [];
+                foreach (($validated['cashiers'] ?? []) as $cashierInput) {
+                    $actualByUser[(int) $cashierInput['user_id']] = (float) $cashierInput['actual_cash'];
                 }
 
-                $cashier = User::where('id', $lockedShift->user_id)
-                    ->where('restaurant_id', $restaurantId)
-                    ->firstOrFail();
-                app(CashierAccountService::class)->ensureFor($cashier);
-                $vaultAccountId = $cashier->vault_account_id;
                 $revenueAccount = Account::firstOrCreate(
                     ['restaurant_id' => $restaurantId, 'code' => '4000'],
                     ['name' => 'إيرادات المبيعات', 'type' => 'revenue', 'opening_balance' => 0, 'is_active' => true]
@@ -1051,39 +1182,95 @@ class ShiftWorkflowController extends Controller
                 }
 
                 $posting = app(JournalPostingService::class);
-                $lines = [];
-                $settlementLines = [];
-                $totalRevenue = 0.0;
-                foreach ($byPayment as $method => $amount) {
-                    $amount = round((float) $amount, 2);
-                    if ($amount <= 0) {
+                $totals = [
+                    'opening' => 0.0,
+                    'expected' => 0.0,
+                    'actual' => 0.0,
+                    'difference' => 0.0,
+                ];
+
+                foreach ($balances as $balance) {
+                    $cashierId = (int) $balance->user_id;
+                    $cashier = $balance->user;
+                    if (! $cashier) {
                         continue;
                     }
-                    $methodAccount = $posting->paymentAccount($restaurantId, $method);
-                    $lines[] = ['account_id' => $vaultAccountId, 'debit' => $amount, 'description' => 'تحصيل وردية في خزنة '.$cashier->name.' - '.$method];
-                    $lines[] = ['account_id' => $revenueAccount->id, 'credit' => $amount, 'description' => 'إيراد مبيعات - '.$method];
-                    $settlementLines[] = ['account_id' => $methodAccount->id, 'debit' => $amount, 'description' => 'توريد الوردية إلى '.$methodAccount->name];
-                    $settlementLines[] = ['account_id' => $vaultAccountId, 'credit' => $amount, 'description' => 'تسليم من خزنة '.$cashier->name.' - '.$method];
-                    $totalRevenue += (float) $amount;
+                    $summary = $this->revenueSummary($lockedShift, $cashierId);
+                    $openingCash = (float) $balance->opening_cash;
+                    $expected = round($openingCash + $summary['cash'], 4);
+
+                    if (array_key_exists($cashierId, $actualByUser)) {
+                        $actual = round((float) $actualByUser[$cashierId], 4);
+                    } elseif ($request->has('actual_cash') && $cashierId === (int) $user->id) {
+                        $actual = round((float) $validated['actual_cash'], 4);
+                    } else {
+                        $actual = $expected;
+                    }
+                    $difference = round($actual - $expected, 4);
+
+                    $balance->update([
+                        'expected_cash' => $expected,
+                        'actual_cash' => $actual,
+                        'difference' => $difference,
+                        'closed_at' => now(),
+                    ]);
+
+                    $totals['opening'] += $openingCash;
+                    $totals['expected'] += $expected;
+                    $totals['actual'] += $actual;
+                    $totals['difference'] += $difference;
+
+                    if ($summary['total'] <= 0) {
+                        continue;
+                    }
+
+                    app(CashierAccountService::class)->ensureFor($cashier);
+                    $vaultAccountId = $cashier->vault_account_id;
+                    $reference = $cashierId === (int) $lockedShift->user_id
+                        ? 'SHIFT-'.$lockedShift->id
+                        : 'SHIFT-'.$lockedShift->id.'-U'.$cashierId;
+
+                    $lines = [];
+                    $settlementLines = [];
+                    foreach ($summary['by_payment_method'] as $method => $amount) {
+                        $amount = round((float) $amount, 2);
+                        if ($amount <= 0) {
+                            continue;
+                        }
+                        $methodAccount = $posting->paymentAccount($restaurantId, (string) $method);
+                        $lines[] = ['account_id' => $vaultAccountId, 'debit' => $amount, 'description' => 'تحصيل وردية في خزنة '.$cashier->name.' - '.$method];
+                        $lines[] = ['account_id' => $revenueAccount->id, 'credit' => $amount, 'description' => 'إيراد مبيعات - '.$method];
+                        $settlementLines[] = ['account_id' => $methodAccount->id, 'debit' => $amount, 'description' => 'توريد الوردية إلى '.$methodAccount->name];
+                        $settlementLines[] = ['account_id' => $vaultAccountId, 'credit' => $amount, 'description' => 'تسليم من خزنة '.$cashier->name.' - '.$method];
+                    }
+                    if (! empty($lines)) {
+                        $posting->post(
+                            $restaurantId,
+                            'SH-',
+                            $reference,
+                            Carbon::parse($lockedShift->shift_date)->toDateString(),
+                            'قيد إغلاق الوردية #'.$lockedShift->id.' - '.$cashier->name,
+                            $user->id,
+                            array_merge($lines, $settlementLines)
+                        );
+                        $journalCreated = true;
+                    }
                 }
-                if ($totalRevenue > 0) {
-                    $posting->post(
-                        $restaurantId,
-                        'SH-',
-                        'SHIFT-'.$lockedShift->id,
-                        Carbon::parse($lockedShift->shift_date)->toDateString(),
-                        'قيد إغلاق الوردية #'.$lockedShift->id,
-                        $request->user()->id,
-                        array_merge($lines, $settlementLines)
-                    );
-                    $journalCreated = true;
+
+                $validated['expected_cash'] = round($totals['expected'], 4);
+                $validated['actual_cash'] = round($totals['actual'], 4);
+                $validated['difference'] = round($totals['difference'], 4);
+                $validated['status'] = 'closed';
+                $validated['closed_at'] = now();
+                if (empty($validated['end_time'])) {
+                    $validated['end_time'] = now()->format('H:i:s');
                 }
+                unset($validated['cashiers']);
 
                 if (isset($validated['end_time']) && is_string($validated['end_time']) && strlen($validated['end_time']) === 5) {
                     $validated['end_time'] .= ':00';
                 }
 
-                // Close the shared shift itself.
                 $lockedShift->update($validated);
 
                 // Defensive: close any other leftovers in the same group.
@@ -1111,6 +1298,8 @@ class ShiftWorkflowController extends Controller
             ]);
         }
 
+        unset($validated['cashiers']);
+
         if ($request->has('actual_cash')) {
             $expected = (float) ($shift->expected_cash ?? $shift->opening_cash ?? 0);
             $validated['difference'] = (float) $validated['actual_cash'] - $expected;
@@ -1125,6 +1314,7 @@ class ShiftWorkflowController extends Controller
             'message' => 'تم تحديث الوردية',
         ]);
     }
+
 
     public function destroy(Shift $shift)
     {
