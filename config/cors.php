@@ -13,6 +13,7 @@ return [
         'http://127.0.0.1:2060',
         'http://server',
         'http://server:2060',
+        'http://server:2040',
         'http://server:80',
     ],
 
