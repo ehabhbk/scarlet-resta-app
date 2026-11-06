@@ -30,6 +30,8 @@ class JournalEntryLine extends Model
 
     public function account(): BelongsTo
     {
-        return $this->belongsTo(Account::class);
+        // Historical entries may reference accounts that were retired (for
+        // example the old per-cashier vault sub-accounts), so include trashed.
+        return $this->belongsTo(Account::class)->withTrashed();
     }
 }

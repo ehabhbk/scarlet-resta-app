@@ -20,6 +20,7 @@ class UserResource extends JsonResource
             'is_active' => (bool) $this->is_active,
             'vault_account_id' => $this->vault_account_id,
             'pay_account_id' => $this->pay_account_id,
+            'revenue_account_id' => $this->revenue_account_id,
             'kitchen_station_id' => $this->kitchen_station_id,
             'kitchen_station' => $this->whenLoaded('kitchenStation', fn () => $this->kitchenStation ? [
                 'id' => $this->kitchenStation->id,
@@ -37,6 +38,13 @@ class UserResource extends JsonResource
                 'code' => $this->payAccount->code,
                 'name' => $this->payAccount->name,
                 'type' => $this->payAccount->type,
+            ] : null),
+            'revenue_account' => $this->whenLoaded('revenueAccount', fn () => $this->revenueAccount ? [
+                'id' => $this->revenueAccount->id,
+                'code' => $this->revenueAccount->code,
+                'name' => $this->revenueAccount->name,
+                'parent_id' => $this->revenueAccount->parent_id,
+                'type' => $this->revenueAccount->type,
             ] : null),
             'roles' => $this->whenLoaded('roles', fn () => $this->roles->map(fn ($r) => [
                 'id' => $r->id,

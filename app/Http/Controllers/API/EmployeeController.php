@@ -439,7 +439,7 @@ class ShiftWorkflowController extends Controller
             'payment_method' => 'required|string|max:50',
         ]);
 
-        $entry = DB::transaction(function () use ($request, $shift, $validated): JournalEntry {
+        DB::transaction(function () use ($request, $shift, $validated): void {
             $lockedShift = Shift::whereKey($shift->id)->lockForUpdate()->firstOrFail();
             if ($lockedShift->status !== 'open') {
                 throw ValidationException::withMessages([
@@ -462,8 +462,6 @@ class ShiftWorkflowController extends Controller
                 ]);
             }
 
-            $workDate = Carbon::parse($lockedShift->shift_date)->toDateString();
-            $reference = $this->wageReference($employee, $workDate, $lockedShift, $group);
             if ($employee->pivot->paid_at) {
                 throw ValidationException::withMessages([
                     'employee_id' => ['تم دفع أجر هذا الموظف مسبقاً.'],
@@ -481,7 +479,10 @@ class ShiftWorkflowController extends Controller
             }
 
             $posting = app(JournalPostingService::class);
-            $paymentAccount = $posting->assertConfiguredPaymentMethod(
+            // Validate the selected payment method and expense account now so
+            // the cashier gets immediate feedback, but do not post a separate
+            // wage entry. Wages are consolidated into the shift closing entry.
+            $posting->assertConfiguredPaymentMethod(
                 $lockedShift->restaurant_id,
                 $validated['payment_method'],
             );
@@ -502,19 +503,6 @@ class ShiftWorkflowController extends Controller
                 ]);
             }
 
-            $entry = $posting->post(
-                $lockedShift->restaurant_id,
-                'WG-',
-                $reference,
-                $workDate,
-                'أجر '.$employee->name.' - وردية #'.$lockedShift->id,
-                $request->user()->id,
-                [
-                    ['account_id' => $expenseAccount->id, 'debit' => $amount, 'description' => $employee->pay_type],
-                    ['account_id' => $paymentAccount->id, 'credit' => $amount, 'description' => 'دفع الأجر عبر '.$validated['payment_method']],
-                ],
-            );
-
             $relation = $group ? $group->employees() : $lockedShift->employees();
             if (! $group && ! $lockedShift->employees()->whereKey($employee->id)->exists()) {
                 $relation->attach($employee->id);
@@ -523,16 +511,14 @@ class ShiftWorkflowController extends Controller
                 'payment_method' => $validated['payment_method'],
                 'paid_at' => now(),
                 'paid_amount' => $amount,
-                'journal_entry_id' => $entry->id,
+                'journal_entry_id' => null,
                 'paid_by' => $request->user()->id,
             ]);
-
-            return $entry;
         });
 
         return response()->json([
-            'journal_entry' => $entry,
-            'message' => 'تم دفع أجر الموظف وإنشاء القيد المحاسبي',
+            'journal_entry' => null,
+            'message' => 'تم تسجيل دفع أجر الموظف، وسيُدرج في قيد إغلاق الوردية',
         ]);
     }
 
@@ -581,6 +567,143 @@ class ShiftWorkflowController extends Controller
         return (float) ($payments->isNotEmpty()
             ? $payments->sum('amount')
             : $orders->sum('total_amount'));
+    }
+
+    /**
+     * Wage lines that get merged into the shift-closing journal entry.
+     *
+     * @return array{lines:array<int,array{account_id:int,debit?:float,credit?:float,description?:string}>,total:float}
+     */
+    private function shiftWageLines(Shift $shift, ?ShiftGroup $group, int $restaurantId): array
+    {
+        $posting = app(JournalPostingService::class);
+        $wageRevenue = $this->wageRevenue($shift, $group);
+        $employees = $this->employeesForWages($shift, $group);
+        $lines = [];
+        $total = 0.0;
+
+        foreach ($employees as $employee) {
+            if ((int) $employee->restaurant_id !== $restaurantId
+                || $employee->status !== 'active'
+                || ! $employee->pay_auto
+                || ! in_array($employee->pay_type, ['daily', 'percentage'], true)) {
+                continue;
+            }
+
+            $amount = (float) ($employee->pivot?->paid_amount ?? 0);
+            if ($amount <= 0) {
+                $amount = $employee->pay_type === 'daily'
+                    ? (float) $employee->pay_rate
+                    : $wageRevenue * ((float) $employee->pay_rate / 100);
+            }
+            $amount = round($amount, 2);
+            if ($amount <= 0) {
+                continue;
+            }
+
+            $expenseAccountId = $employee->pay_account_id ?: $employee->user?->pay_account_id;
+            $expenseAccount = $expenseAccountId
+                ? Account::where('restaurant_id', $restaurantId)
+                    ->whereKey($expenseAccountId)
+                    ->where('type', 'expense')
+                    ->where('is_active', true)
+                    ->first()
+                : null;
+            if (! $expenseAccount) {
+                $expenseAccount = Account::firstOrCreate(
+                    ['restaurant_id' => $restaurantId, 'code' => '5000'],
+                    ['name' => 'رواتب وأجور', 'type' => 'expense', 'opening_balance' => 0, 'is_active' => true],
+                );
+            }
+
+            $method = $employee->pivot?->payment_method ?: $this->defaultPaymentMethod($restaurantId);
+            $paymentAccount = $posting->paymentAccount($restaurantId, (string) $method);
+
+            $lines[] = [
+                'account_id' => $expenseAccount->id,
+                'debit' => $amount,
+                'description' => 'أجر '.$employee->name.' - '.$employee->pay_type,
+            ];
+            $lines[] = [
+                'account_id' => $paymentAccount->id,
+                'credit' => $amount,
+                'description' => 'دفع أجر '.$employee->name.' عبر '.$method,
+            ];
+            $total += $amount;
+        }
+
+        return ['lines' => $lines, 'total' => round($total, 4)];
+    }
+
+    /**
+     * Wage details shown in the shift report.
+     *
+     * @return array{wages:array<int,array<string,mixed>>,wages_total:float}
+     */
+    private function shiftWages(Shift $shift, ?ShiftGroup $group): array
+    {
+        $wageRevenue = $this->wageRevenue($shift, $group);
+        $employees = $this->employeesForWages($shift, $group);
+        $wages = [];
+        $total = 0.0;
+
+        foreach ($employees as $employee) {
+            if ($employee->status !== 'active'
+                || ! $employee->pay_auto
+                || ! in_array($employee->pay_type, ['daily', 'percentage'], true)) {
+                continue;
+            }
+
+            $amount = (float) ($employee->pivot?->paid_amount ?? 0);
+            if ($amount <= 0) {
+                $amount = $employee->pay_type === 'daily'
+                    ? (float) $employee->pay_rate
+                    : $wageRevenue * ((float) $employee->pay_rate / 100);
+            }
+            $amount = round($amount, 4);
+            if ($amount <= 0) {
+                continue;
+            }
+
+            $wages[] = [
+                'employee_id' => (int) $employee->id,
+                'employee_name' => $employee->name,
+                'pay_type' => $employee->pay_type,
+                'pay_rate' => (float) $employee->pay_rate,
+                'amount' => $amount,
+                'payment_method' => $employee->pivot?->payment_method,
+                'paid' => (bool) $employee->pivot?->paid_at,
+                'paid_at' => $employee->pivot?->paid_at,
+            ];
+            $total += $amount;
+        }
+
+        return ['wages' => $wages, 'wages_total' => round($total, 4)];
+    }
+
+    private function defaultPaymentMethod(int $restaurantId): string
+    {
+        $settings = Setting::where('restaurant_id', $restaurantId)
+            ->where('group', 'pos')
+            ->where('key', 'payment_methods')
+            ->value('value');
+        $methods = $settings !== null ? json_decode($settings, true) : null;
+
+        if (is_array($methods)) {
+            foreach ($methods as $method) {
+                if (! is_array($method)) {
+                    continue;
+                }
+                $value = $method['value'] ?? $method['method'] ?? null;
+                if (is_string($value) && trim($value) !== '' && ! empty($method['account_id'])) {
+                    return $value;
+                }
+            }
+        }
+
+        throw ValidationException::withMessages([
+            'payment_method' => ['لم تُضبط طرق دفع مرتبطة بحسابات؛ لا يمكن ترحيل أجور الوردية.'],
+        ]);
     }
 
     private function userHasShiftPermission(User $user, string $permission): bool
@@ -934,6 +1057,8 @@ class ShiftWorkflowController extends Controller
 
         $ordersTotal = round((float) $cashiers->sum('total'), 4);
         $expensesTotal = round((float) $expenses->sum('amount'), 4);
+        $wageData = $this->shiftWages($shift, $shift->shift_group_id ? $shift->group : null);
+        $wagesTotal = (float) $wageData['wages_total'];
 
         return response()->json([
             'total' => $ordersTotal,
@@ -943,7 +1068,9 @@ class ShiftWorkflowController extends Controller
             'orders' => $allOrders->values(),
             'expenses' => $expenses,
             'expenses_total' => $expensesTotal,
-            'net_total' => round($ordersTotal - $expensesTotal, 4),
+            'wages' => $wageData['wages'],
+            'wages_total' => $wagesTotal,
+            'net_total' => round($ordersTotal - $expensesTotal - $wagesTotal, 4),
             'opening_cash' => (float) ($baseShift->opening_cash ?? 0),
             'expected_cash' => (float) ($baseShift->expected_cash ?? 0),
             'actual_cash' => (float) ($baseShift->actual_cash ?? 0),
@@ -1196,16 +1323,6 @@ class ShiftWorkflowController extends Controller
                     $actualByUser[(int) $cashierInput['user_id']] = (float) $cashierInput['actual_cash'];
                 }
 
-                $revenueAccount = Account::firstOrCreate(
-                    ['restaurant_id' => $restaurantId, 'code' => '4000'],
-                    ['name' => 'إيرادات المبيعات', 'type' => 'revenue', 'opening_balance' => 0, 'is_active' => true]
-                );
-                if ($revenueAccount->type !== 'revenue' || ! $revenueAccount->is_active) {
-                    throw ValidationException::withMessages([
-                        'account_id' => ['حساب إيرادات المبيعات غير صالح أو غير نشط.'],
-                    ]);
-                }
-
                 $posting = app(JournalPostingService::class);
                 $totals = [
                     'opening' => 0.0,
@@ -1213,6 +1330,10 @@ class ShiftWorkflowController extends Controller
                     'actual' => 0.0,
                     'difference' => 0.0,
                 ];
+                $wageData = $this->shiftWageLines($lockedShift, $group, $restaurantId);
+                $openerCashierId = (int) $lockedShift->user_id;
+                $openerLines = [];
+                $entryDate = Carbon::parse($lockedShift->shift_date)->toDateString();
 
                 foreach ($balances as $balance) {
                     $cashierId = (int) $balance->user_id;
@@ -1249,38 +1370,71 @@ class ShiftWorkflowController extends Controller
                         continue;
                     }
 
-                    app(CashierAccountService::class)->ensureFor($cashier);
-                    $vaultAccountId = $cashier->vault_account_id;
-                    $reference = $cashierId === (int) $lockedShift->user_id
-                        ? 'SHIFT-'.$lockedShift->id
-                        : 'SHIFT-'.$lockedShift->id.'-U'.$cashierId;
+                    // Each cashier's collections are posted directly against the
+                    // configured payment-method accounts and credited to that
+                    // cashier's own sales-revenue sub-account.
+                    $cashierRevenueAccount = app(CashierAccountService::class)
+                        ->ensureRevenueAccountFor($cashier);
 
                     $lines = [];
-                    $settlementLines = [];
                     foreach ($summary['by_payment_method'] as $method => $amount) {
                         $amount = round((float) $amount, 2);
                         if ($amount <= 0) {
                             continue;
                         }
                         $methodAccount = $posting->paymentAccount($restaurantId, (string) $method);
-                        $lines[] = ['account_id' => $vaultAccountId, 'debit' => $amount, 'description' => 'تحصيل وردية في خزنة '.$cashier->name.' - '.$method];
-                        $lines[] = ['account_id' => $revenueAccount->id, 'credit' => $amount, 'description' => 'إيراد مبيعات - '.$method];
-                        $settlementLines[] = ['account_id' => $methodAccount->id, 'debit' => $amount, 'description' => 'توريد الوردية إلى '.$methodAccount->name];
-                        $settlementLines[] = ['account_id' => $vaultAccountId, 'credit' => $amount, 'description' => 'تسليم من خزنة '.$cashier->name.' - '.$method];
+                        $lines[] = [
+                            'account_id' => $methodAccount->id,
+                            'debit' => $amount,
+                            'description' => 'تحصيل وردية - '.$method.' - '.$cashier->name,
+                        ];
+                        $lines[] = [
+                            'account_id' => $cashierRevenueAccount->id,
+                            'credit' => $amount,
+                            'description' => 'إيراد مبيعات '.$cashier->name.' - '.$method,
+                        ];
                     }
-                    if (! empty($lines)) {
+                    if (empty($lines)) {
+                        continue;
+                    }
+
+                    if ($cashierId === $openerCashierId) {
+                        // The opener entry also carries the shift wages below.
+                        $openerLines = array_merge($openerLines, $lines);
+                    } else {
                         $posting->post(
                             $restaurantId,
                             'SH-',
-                            $reference,
-                            Carbon::parse($lockedShift->shift_date)->toDateString(),
+                            'SHIFT-'.$lockedShift->id.'-U'.$cashierId,
+                            $entryDate,
                             'قيد إغلاق الوردية #'.$lockedShift->id.' - '.$cashier->name,
                             $user->id,
-                            array_merge($lines, $settlementLines)
+                            $lines
                         );
                         $journalCreated = true;
                     }
                 }
+
+                // Wages are merged into the opener's closing entry so a single
+                // entry reflects revenue, expenses and wages for the shift.
+                if (! empty($wageData['lines'])) {
+                    $openerLines = array_merge($openerLines, $wageData['lines']);
+                }
+
+                if (! empty($openerLines)) {
+                    $posting->post(
+                        $restaurantId,
+                        'SH-',
+                        'SHIFT-'.$lockedShift->id,
+                        $entryDate,
+                        'قيد إغلاق الوردية #'.$lockedShift->id.' - '.($lockedShift->user?->name ?? ''),
+                        $user->id,
+                        $openerLines
+                    );
+                    $journalCreated = true;
+                }
+
+                $validated['wages_total'] = $wageData['total'];
 
                 $validated['expected_cash'] = round($totals['expected'], 4);
                 $validated['actual_cash'] = round($totals['actual'], 4);

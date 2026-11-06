@@ -143,6 +143,7 @@ class Shift extends Model
         'expected_cash',
         'actual_cash',
         'difference',
+        'wages_total',
         'closed_at',
         'notes',
     ];
@@ -155,6 +156,7 @@ class Shift extends Model
         'expected_cash' => 'decimal:4',
         'actual_cash' => 'decimal:4',
         'difference' => 'decimal:4',
+        'wages_total' => 'decimal:4',
         'closed_at' => 'datetime',
     ];
 

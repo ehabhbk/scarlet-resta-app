@@ -48,6 +48,7 @@ class User extends Authenticatable
         'is_active',
         'vault_account_id',
         'pay_account_id',
+        'revenue_account_id',
         'kitchen_station_id',
     ];
 
@@ -98,6 +99,11 @@ class User extends Authenticatable
     public function payAccount()
     {
         return $this->belongsTo(Account::class, 'pay_account_id');
+    }
+
+    public function revenueAccount()
+    {
+        return $this->belongsTo(Account::class, 'revenue_account_id');
     }
 
     public function kitchenStation()

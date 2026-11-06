@@ -34,7 +34,10 @@ class CashierAccountingTest extends TestCase
         $admin = $this->createUser($restaurant);
         $adminRole = Role::create(['name' => 'Super Admin', 'guard_name' => 'sanctum']);
         $admin->assignRole($adminRole);
-        Role::create(['name' => 'Cashier', 'guard_name' => 'sanctum']);
+        $cashierRole = Role::create(['name' => 'Cashier', 'guard_name' => 'sanctum']);
+        foreach (['view_pos', 'create_orders'] as $permission) {
+            $cashierRole->givePermissionTo(Permission::firstOrCreate(['name' => $permission, 'guard_name' => 'sanctum']));
+        }
 
         $this->actingAs($admin, 'sanctum')
             ->postJson('/api/admin/users', [
@@ -44,15 +47,15 @@ class CashierAccountingTest extends TestCase
                 'role' => 'Cashier',
             ])
             ->assertCreated()
-            ->assertJsonPath('user.vault_account.name', 'خزنة Ehab Cashier')
+            ->assertJsonPath('user.revenue_account.name', 'إيرادات Ehab Cashier')
             ->assertJsonPath('user.pay_account.name', 'مصروف أجور Ehab Cashier');
 
         $user = User::where('username', 'ehab.cashier')->firstOrFail();
-        $this->assertNotNull($user->vault_account_id);
+        $this->assertNotNull($user->revenue_account_id);
         $this->assertNotNull($user->pay_account_id);
         $this->assertSame(
-            (int) Account::where('restaurant_id', $restaurant->id)->where('code', '1000')->value('id'),
-            (int) Account::whereKey($user->vault_account_id)->value('parent_id')
+            (int) Account::where('restaurant_id', $restaurant->id)->where('code', '4000')->value('id'),
+            (int) Account::whereKey($user->revenue_account_id)->value('parent_id')
         );
         $this->assertSame(
             (int) Account::where('restaurant_id', $restaurant->id)->where('code', '5000')->value('id'),
@@ -63,7 +66,10 @@ class CashierAccountingTest extends TestCase
     public function test_registration_also_provisions_accounts_for_a_cashier_role(): void
     {
         $restaurant = $this->createRestaurant();
-        Role::create(['name' => 'Cashier', 'guard_name' => 'sanctum']);
+        $cashierRole = Role::create(['name' => 'Cashier', 'guard_name' => 'sanctum']);
+        foreach (['view_pos', 'create_orders'] as $permission) {
+            $cashierRole->givePermissionTo(Permission::firstOrCreate(['name' => $permission, 'guard_name' => 'sanctum']));
+        }
 
         $this->postJson('/api/auth/register', [
             'name' => 'Registered Cashier',
@@ -74,7 +80,7 @@ class CashierAccountingTest extends TestCase
             'role' => 'Cashier',
         ])
             ->assertCreated()
-            ->assertJsonPath('user.vault_account.name', 'خزنة Registered Cashier')
+            ->assertJsonPath('user.revenue_account.name', 'إيرادات Registered Cashier')
             ->assertJsonPath('user.pay_account.name', 'مصروف أجور Registered Cashier');
     }
 
@@ -97,27 +103,31 @@ class CashierAccountingTest extends TestCase
 
         $user = User::where('username', 'restaurant.manager')->firstOrFail();
         $this->assertNotNull($user->pay_account_id);
-        $this->assertNull($user->vault_account_id);
+        $this->assertNull($user->revenue_account_id);
     }
 
-    public function test_creating_a_cashier_keeps_the_selected_sub_vault_linked(): void
+    public function test_creating_a_cashier_keeps_the_selected_revenue_account_linked(): void
     {
         $restaurant = $this->createRestaurant();
         $admin = $this->createUser($restaurant);
         $admin->assignRole(Role::create(['name' => 'Super Admin', 'guard_name' => 'sanctum']));
-        Role::create(['name' => 'Cashier', 'guard_name' => 'sanctum']);
+        $cashierRole = Role::create(['name' => 'Cashier', 'guard_name' => 'sanctum']);
+        foreach (['view_pos', 'create_orders'] as $permission) {
+            $cashierRole->givePermissionTo(Permission::firstOrCreate(['name' => $permission, 'guard_name' => 'sanctum']));
+        }
         $parent = Account::create([
             'restaurant_id' => $restaurant->id,
-            'code' => '1000',
-            'name' => 'الخزنة الرئيسية',
-            'type' => 'asset',
+            'code' => '4000',
+            'name' => 'إيرادات المبيعات',
+            'type' => 'revenue',
         ]);
-        $vault = Account::create([
+        $revenue = Account::create([
             'restaurant_id' => $restaurant->id,
             'parent_id' => $parent->id,
-            'code' => '1101',
-            'name' => 'خزنة الكاشير المخصصة',
-            'type' => 'asset',
+            'code' => '4199',
+            'name' => 'إيراد كاشير مخصص',
+            'type' => 'revenue',
+            'is_active' => true,
         ]);
 
         $this->actingAs($admin, 'sanctum')
@@ -126,11 +136,11 @@ class CashierAccountingTest extends TestCase
                 'username' => 'linked.cashier',
                 'password' => 'secret123',
                 'role' => 'Cashier',
-                'vault_account_id' => $vault->id,
+                'revenue_account_id' => $revenue->id,
             ])
             ->assertCreated()
-            ->assertJsonPath('user.vault_account_id', $vault->id)
-            ->assertJsonPath('user.vault_account.name', 'خزنة الكاشير المخصصة');
+            ->assertJsonPath('user.revenue_account_id', $revenue->id)
+            ->assertJsonPath('user.revenue_account.name', 'إيراد كاشير مخصص');
     }
 
     public function test_opening_a_shift_links_selected_daily_and_percentage_employees(): void
@@ -439,7 +449,7 @@ class CashierAccountingTest extends TestCase
         $cashier = $this->createUser($restaurant);
         $cashierRole = Role::create(['name' => 'Cashier', 'guard_name' => 'sanctum']);
         $cashier->assignRole($cashierRole);
-        $this->grantPermissions($cashier, ['close_shift', 'pay_employee_wages', 'view_pos']);
+        $this->grantPermissions($cashier, ['close_shift', 'pay_employee_wages', 'view_pos', 'create_orders']);
         app(CashierAccountService::class)->ensureFor($cashier);
 
         $cashAccount = Account::create([
@@ -597,24 +607,15 @@ class CashierAccountingTest extends TestCase
 
         $entry = JournalEntry::where('reference', 'SHIFT-'.$shift->id)->firstOrFail();
         $lines = JournalEntryLine::where('journal_entry_id', $entry->id)->get();
-        $this->assertSame(600.0, (float) $lines->sum('debit'));
-        $this->assertSame(600.0, (float) $lines->sum('credit'));
-        $this->assertSame(300.0, (float) $lines->where('account_id', $cashier->vault_account_id)->sum('debit'));
-        $this->assertSame(300.0, (float) $lines->where('account_id', $cashier->vault_account_id)->sum('credit'));
+        $this->assertSame(360.0, (float) $lines->sum('debit'));
+        $this->assertSame(360.0, (float) $lines->sum('credit'));
+        $this->assertSame(300.0, (float) $lines->where('account_id', $cashier->revenue_account_id)->sum('credit'));
         $this->assertSame(100.0, (float) $lines->where('account_id', $cashAccount->id)->sum('debit'));
+        $this->assertSame(30.0, (float) $lines->where('account_id', $cashAccount->id)->sum('credit'));
         $this->assertSame(200.0, (float) $lines->where('account_id', $fawryAccount->id)->sum('debit'));
-
-        $wageEntry = JournalEntry::where('reference', 'WAGE-'.$employee->id.'-'.now()->toDateString())->firstOrFail();
-        $this->assertSame(
-            30.0,
-            (float) JournalEntryLine::where('journal_entry_id', $wageEntry->id)
-                ->where('account_id', $cashier->pay_account_id)
-                ->sum('debit')
-        );
-        $commissionEntry = JournalEntry::where('reference', 'WAGE-'.$commissionEmployee->id.'-'.$shift->id)->firstOrFail();
-        $commissionLines = JournalEntryLine::where('journal_entry_id', $commissionEntry->id)->get();
-        $this->assertSame(30.0, (float) $commissionLines->where('account_id', $commissionExpense->id)->sum('debit'));
-        $this->assertSame(30.0, (float) $commissionLines->where('account_id', $fawryAccount->id)->sum('credit'));
+        $this->assertSame(30.0, (float) $lines->where('account_id', $fawryAccount->id)->sum('credit'));
+        $this->assertSame(30.0, (float) $lines->where('account_id', $cashier->pay_account_id)->sum('debit'));
+        $this->assertSame(30.0, (float) $lines->where('account_id', $commissionExpense->id)->sum('debit'));
 
         $this->putJson('/api/shifts/'.$shift->id, [
             'status' => 'closed',
@@ -671,7 +672,7 @@ class CashierAccountingTest extends TestCase
         $restaurant = $this->createRestaurant();
         $cashier = $this->createUser($restaurant);
         $cashier->assignRole(Role::create(['name' => 'Cashier', 'guard_name' => 'sanctum']));
-        $this->grantPermissions($cashier, ['close_shift', 'pay_employee_wages']);
+        $this->grantPermissions($cashier, ['close_shift', 'pay_employee_wages', 'view_pos', 'create_orders']);
         app(CashierAccountService::class)->ensureFor($cashier);
         $cashAccount = Account::create([
             'restaurant_id' => $restaurant->id,
@@ -765,12 +766,15 @@ class CashierAccountingTest extends TestCase
             ->putJson('/api/shifts/'.$shift->id, ['status' => 'closed'])
             ->assertOk();
 
-        $wageEntry = JournalEntry::where('reference', 'WAGE-'.$employee->id.'-'.$shift->id)->firstOrFail();
+        $shiftEntry = JournalEntry::where('reference', 'SHIFT-'.$shift->id)->firstOrFail();
+        $wageLines = JournalEntryLine::where('journal_entry_id', $shiftEntry->id)->get();
         $this->assertSame(
             50.0,
-            (float) JournalEntryLine::where('journal_entry_id', $wageEntry->id)
-                ->where('account_id', $cashier->pay_account_id)
-                ->sum('debit')
+            (float) $wageLines->where('account_id', $cashier->pay_account_id)->sum('debit')
+        );
+        $this->assertSame(
+            50.0,
+            (float) $wageLines->where('account_id', $cashAccount->id)->sum('credit')
         );
         $this->assertSame(
             0,

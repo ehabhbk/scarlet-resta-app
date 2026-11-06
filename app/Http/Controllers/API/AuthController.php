@@ -29,10 +29,16 @@ class AuthController extends Controller
             return response()->json(['message' => 'الحساب معطل، راجع المشرف'], 403);
         }
 
+        try {
+            app(CashierAccountService::class)->ensureFor($user);
+        } catch (\Throwable) {
+            // Account provisioning must never block authentication.
+        }
+
         $token = $user->createToken('auth_token')->plainTextToken;
 
         return response()->json([
-            'user' => new UserResource($user->load('restaurant', 'roles', 'vaultAccount', 'payAccount')),
+            'user' => new UserResource($user->load('restaurant', 'roles', 'revenueAccount', 'payAccount')),
             'token' => $token,
             'message' => 'تم تسجيل الدخول بنجاح',
         ]);
@@ -74,7 +80,7 @@ class AuthController extends Controller
         $token = $user->createToken('auth_token')->plainTextToken;
 
         return response()->json([
-            'user' => new UserResource($user->load('restaurant', 'roles', 'vaultAccount', 'payAccount')),
+            'user' => new UserResource($user->load('restaurant', 'roles', 'revenueAccount', 'payAccount')),
             'token' => $token,
             'message' => 'تم إنشاء الحساب بنجاح',
         ], 201);
@@ -90,7 +96,7 @@ class AuthController extends Controller
     public function me(Request $request)
     {
         return response()->json([
-            'user' => new UserResource($request->user()->load('restaurant', 'roles', 'vaultAccount', 'payAccount')),
+            'user' => new UserResource($request->user()->load('restaurant', 'roles', 'revenueAccount', 'payAccount')),
         ]);
     }
 
@@ -109,7 +115,7 @@ class AuthController extends Controller
         ]);
 
         return response()->json([
-            'user' => new UserResource($user->fresh()->load('restaurant', 'roles', 'vaultAccount', 'payAccount')),
+            'user' => new UserResource($user->fresh()->load('restaurant', 'roles', 'revenueAccount', 'payAccount')),
             'message' => 'تم تحديث الصورة الشخصية',
         ]);
     }

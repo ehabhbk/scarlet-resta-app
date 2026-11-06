@@ -24,7 +24,7 @@ class UserController extends Controller
     {
         $restaurantId = $request->user()->restaurant_id;
         $users = User::where('restaurant_id', $restaurantId)
-            ->with(['roles', 'vaultAccount', 'payAccount', 'kitchenStation'])
+            ->with(['roles', 'revenueAccount', 'payAccount', 'kitchenStation'])
             ->orderBy('name')
             ->paginate(min(max($request->integer('per_page', 15), 1), 100));
 
@@ -40,13 +40,14 @@ class UserController extends Controller
             'phone' => 'nullable|string|max:50',
             'role' => 'required|string',
             'is_active' => 'boolean',
-            'vault_account_id' => [
+            'revenue_account_id' => [
                 'nullable',
                 'integer',
                 Rule::exists('accounts', 'id')->where(fn ($query) => $query
                     ->where('restaurant_id', $request->user()->restaurant_id)
-                    ->where('type', 'asset')
-                    ->whereNotNull('parent_id')),
+                    ->where('type', 'revenue')
+                    ->whereNotNull('parent_id')
+                    ->where('is_active', true)),
             ],
             'pay_account_id' => [
                 'nullable',
@@ -77,20 +78,16 @@ class UserController extends Controller
         $user = DB::transaction(function () use ($validated, $roleName) {
             $user = User::create($validated);
             $role = Role::where('name', $roleName)->where('guard_name', 'sanctum')->first();
-            $accountService = app(CashierAccountService::class);
-            $accountService->ensurePayAccountFor($user);
             if ($role) {
                 $user->assignRole($role);
-                if ($accountService->isCashierRole($role->name)) {
-                    $accountService->ensureFor($user);
-                }
             }
+            app(CashierAccountService::class)->ensureFor($user);
 
             return $user;
         });
 
         return response()->json([
-            'user' => new UserResource($user->fresh()->load(['roles', 'vaultAccount', 'payAccount', 'kitchenStation'])),
+            'user' => new UserResource($user->fresh()->load(['roles', 'revenueAccount', 'payAccount', 'kitchenStation'])),
             'message' => 'تم إضافة المستخدم',
         ], 201);
     }
@@ -101,7 +98,7 @@ class UserController extends Controller
             abort(403);
         }
 
-        return response()->json(['user' => new UserResource($user->load(['roles', 'vaultAccount', 'payAccount', 'kitchenStation']))]);
+        return response()->json(['user' => new UserResource($user->load(['roles', 'revenueAccount', 'payAccount', 'kitchenStation']))]);
     }
 
     public function update(Request $request, User $user)
@@ -116,14 +113,15 @@ class UserController extends Controller
             'phone' => 'sometimes|nullable|string|max:50',
             'role' => 'sometimes|string',
             'is_active' => 'sometimes|boolean',
-            'vault_account_id' => [
+            'revenue_account_id' => [
                 'sometimes',
                 'nullable',
                 'integer',
                 Rule::exists('accounts', 'id')->where(fn ($query) => $query
                     ->where('restaurant_id', $user->restaurant_id)
-                    ->where('type', 'asset')
-                    ->whereNotNull('parent_id')),
+                    ->where('type', 'revenue')
+                    ->whereNotNull('parent_id')
+                    ->where('is_active', true)),
             ],
             'pay_account_id' => [
                 'sometimes',
@@ -176,19 +174,16 @@ class UserController extends Controller
                 $user->syncRoles([$role]);
             }
             $accountService = app(CashierAccountService::class);
-            $accountService->ensurePayAccountFor($user);
+            $accountService->ensureFor($user);
             if ($updateEmployeeAccount) {
                 Employee::where('restaurant_id', $user->restaurant_id)
                     ->where('user_id', $user->id)
                     ->update(['pay_account_id' => $user->pay_account_id]);
             }
-            if ($user->roles()->get()->contains(fn (Role $role) => $accountService->isCashierRole($role->name))) {
-                $accountService->ensureFor($user);
-            }
         });
 
         return response()->json([
-            'user' => new UserResource($user->fresh()->load(['roles', 'vaultAccount', 'payAccount', 'kitchenStation'])),
+            'user' => new UserResource($user->fresh()->load(['roles', 'revenueAccount', 'payAccount', 'kitchenStation'])),
             'message' => 'تم تحديث المستخدم',
         ]);
     }

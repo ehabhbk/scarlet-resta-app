@@ -5,6 +5,7 @@ namespace App\Services;
 use App\Models\Account;
 use App\Models\User;
 use Illuminate\Validation\ValidationException;
+use Spatie\Permission\Models\Permission;
 
 class CashierAccountService
 {
@@ -17,7 +18,7 @@ class CashierAccountService
             : null;
         if ($user->pay_account_id && (! $pay || $pay->type !== 'expense' || ! $pay->is_active)) {
             throw ValidationException::withMessages([
-                'pay_account_id' => ['يجب اختيار حساب مصروف أجور نشط من حسابات المطعم.'],
+                'pay_account_id' => ['حساب مصروف الأجر المحدد غير صالح أو غير نشط.'],
             ]);
         }
         if (! $pay) {
@@ -27,7 +28,7 @@ class CashierAccountService
             );
             if ($expenseAccount->type !== 'expense' || ! $expenseAccount->is_active) {
                 throw ValidationException::withMessages([
-                    'pay_account_id' => ['حساب الأجور الافتراضي غير صالح أو غير نشط.'],
+                    'pay_account_id' => ['حساب الرواتب الرئيسي غير صالح أو غير نشط.'],
                 ]);
             }
             $pay = Account::firstOrCreate(
@@ -44,7 +45,7 @@ class CashierAccountService
 
         if ($pay->type !== 'expense' || ! $pay->is_active) {
             throw ValidationException::withMessages([
-                'pay_account_id' => ['يجب ربط المستخدم بحساب مصروف أجور نشط.'],
+                'pay_account_id' => ['حساب مصروف الأجر غير صالح أو غير نشط.'],
             ]);
         }
 
@@ -55,54 +56,92 @@ class CashierAccountService
         return $pay;
     }
 
-    public function ensureFor(User $user): void
+    /**
+     * Ensure the user owns a sales-revenue sub-account under 4000.
+     *
+     * This is used at shift closing for every cashier even when their role no
+     * longer carries the POS permissions, so the closing entry always resolves
+     * to a concrete revenue account.
+     */
+    public function ensureRevenueAccountFor(User $user): Account
     {
         $restaurantId = $user->restaurant_id;
+        $parent = Account::firstOrCreate(
+            ['restaurant_id' => $restaurantId, 'code' => '4000'],
+            ['name' => 'إيرادات المبيعات', 'type' => 'revenue', 'opening_balance' => 0, 'is_active' => true]
+        );
+
+        if ($parent->type !== 'revenue' || ! $parent->is_active) {
+            throw ValidationException::withMessages([
+                'revenue_account_id' => ['حساب إيرادات المبيعات الرئيسي غير صالح أو غير نشط.'],
+            ]);
+        }
+
+        $revenue = $user->revenue_account_id
+            ? Account::where('restaurant_id', $restaurantId)->whereKey($user->revenue_account_id)->first()
+            : null;
+
+        if ($user->revenue_account_id && (! $revenue || $revenue->type !== 'revenue' || ! $revenue->is_active)) {
+            throw ValidationException::withMessages([
+                'revenue_account_id' => ['حساب إيراد المستخدم المحدد غير صالح أو غير نشط.'],
+            ]);
+        }
+
+        if (! $revenue) {
+            $suffix = str_pad((string) $user->id, 3, '0', STR_PAD_LEFT);
+            $revenue = Account::firstOrCreate(
+                ['restaurant_id' => $restaurantId, 'code' => '41'.$suffix],
+                [
+                    'parent_id' => $parent->id,
+                    'name' => 'إيرادات '.$user->name,
+                    'type' => 'revenue',
+                    'opening_balance' => 0,
+                    'is_active' => true,
+                ]
+            );
+        }
+
+        if ($revenue->type !== 'revenue' || ! $revenue->is_active) {
+            throw ValidationException::withMessages([
+                'revenue_account_id' => ['حساب إيراد المستخدم غير صالح أو غير نشط.'],
+            ]);
+        }
+
+        if ((int) $user->revenue_account_id !== (int) $revenue->id) {
+            $user->forceFill(['revenue_account_id' => $revenue->id])->save();
+        }
+
+        return $revenue;
+    }
+
+    /**
+     * A user is a POS cashier when they can both open the POS screen and
+     * create orders. Only these users need a personal revenue account.
+     */
+    public function userWorksPos(User $user): bool
+    {
+        foreach (['view_pos', 'create_orders'] as $permission) {
+            if (! Permission::where('name', $permission)
+                ->where('guard_name', 'sanctum')
+                ->exists()) {
+                return false;
+            }
+        }
+
+        try {
+            return $user->hasPermissionTo('view_pos', 'sanctum')
+                && $user->hasPermissionTo('create_orders', 'sanctum');
+        } catch (\Throwable) {
+            return false;
+        }
+    }
+
+    public function ensureFor(User $user): void
+    {
         $this->ensurePayAccountFor($user);
-        $cashAccount = Account::firstOrCreate(
-            ['restaurant_id' => $restaurantId, 'code' => '1000'],
-            ['name' => 'الخزنة الرئيسية', 'type' => 'asset', 'opening_balance' => 0, 'is_active' => true]
-        );
-        if ($cashAccount->type !== 'asset' || ! $cashAccount->is_active) {
-            throw ValidationException::withMessages([
-                'vault_account_id' => ['حساب الخزينة الافتراضي غير صالح أو غير نشط.'],
-            ]);
-        }
 
-        $suffix = str_pad((string) $user->id, 3, '0', STR_PAD_LEFT);
-        $vault = $user->vault_account_id
-            ? Account::where('restaurant_id', $restaurantId)->whereKey($user->vault_account_id)->first()
-            : null;
-        $vaultParent = $vault?->parent_id
-            ? Account::where('restaurant_id', $restaurantId)
-                ->whereKey($vault->parent_id)
-                ->where('type', 'asset')
-                ->where('is_active', true)
-                ->first()
-            : null;
-        if ($user->vault_account_id && (! $vault || $vault->type !== 'asset' || ! $vault->is_active || ! $vaultParent)) {
-            throw ValidationException::withMessages([
-                'vault_account_id' => ['يجب ربط الكاشير بحساب خزينة فرعي ونشط من حسابات المطعم.'],
-            ]);
-        }
-        $vault ??= Account::firstOrCreate(
-            ['restaurant_id' => $restaurantId, 'code' => '11'.$suffix],
-            [
-                'parent_id' => $cashAccount->id,
-                'name' => 'خزنة '.$user->name,
-                'type' => 'asset',
-                'opening_balance' => 0,
-                'is_active' => true,
-            ]
-        );
-        if ($vault->type !== 'asset' || ! $vault->is_active || ! $vault->parent_id) {
-            throw ValidationException::withMessages([
-                'vault_account_id' => ['يجب ربط الكاشير بحساب خزينة فرعي ونشط.'],
-            ]);
-        }
-
-        if ((int) $user->vault_account_id !== (int) $vault->id) {
-            $user->forceFill(['vault_account_id' => $vault->id])->save();
+        if ($this->userWorksPos($user)) {
+            $this->ensureRevenueAccountFor($user);
         }
     }
 

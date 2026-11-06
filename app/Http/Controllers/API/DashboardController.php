@@ -180,6 +180,7 @@ class DashboardController extends Controller
             ->select(
                 'order_items.product_id',
                 DB::raw('SUM(order_items.quantity) as sales_count'),
+                DB::raw('COUNT(DISTINCT order_items.order_id) as orders_count'),
                 DB::raw('SUM(order_items.total_price) as revenue')
             )
             ->groupBy('order_items.product_id')
@@ -196,6 +197,7 @@ class DashboardController extends Controller
                 'id' => $product->id,
                 'name' => $product->name,
                 'sales_count' => (int) $row->sales_count,
+                'orders_count' => (int) $row->orders_count,
                 'revenue' => (float) $row->revenue,
                 'sale_price' => (float) $product->sale_price,
                 'image' => PublicMediaUrl::make($product->image),
@@ -243,12 +245,13 @@ class DashboardController extends Controller
         $normalize = fn ($rows) => $rows->map(fn ($row) => [
             'name' => $row->name ?: 'غير محدد',
             'value' => (float) $row->value,
+            'count' => (int) ($row->count ?? 0),
         ])->filter(fn ($row) => $row['value'] > 0)->values();
 
         $sales = $normalize(Order::where('restaurant_id', $restaurantId)
             ->where('payment_status', 'paid')
             ->whereBetween('created_at', [$from, $to])
-            ->select('type as name', DB::raw('SUM(total_amount) as value'))
+            ->select('type as name', DB::raw('SUM(total_amount) as value'), DB::raw('COUNT(*) as count'))
             ->groupBy('type')
             ->orderByDesc('value')
             ->get());
@@ -258,14 +261,14 @@ class DashboardController extends Controller
             ->where('purchases.restaurant_id', $restaurantId)
             ->where('purchases.status', '!=', 'cancelled')
             ->whereBetween('purchases.order_date', [$fromDate, $toDate])
-            ->select('suppliers.name as name', DB::raw('SUM(purchases.total_amount) as value'))
+            ->select('suppliers.name as name', DB::raw('SUM(purchases.total_amount) as value'), DB::raw('COUNT(*) as count'))
             ->groupBy('suppliers.name')
             ->orderByDesc('value')
             ->get());
 
         $expenses = $normalize(Expense::where('restaurant_id', $restaurantId)
             ->whereBetween('expense_date', [$fromDate, $toDate])
-            ->select('category as name', DB::raw('SUM(amount) as value'))
+            ->select('category as name', DB::raw('SUM(amount) as value'), DB::raw('COUNT(*) as count'))
             ->groupBy('category')
             ->orderByDesc('value')
             ->get());
@@ -279,8 +282,13 @@ class DashboardController extends Controller
             ->whereBetween('orders.created_at', [$from, $to]);
 
         $productTotal = (float) (clone $productQuery)->sum('order_items.total_price');
+        $productTotalCount = (float) (clone $productQuery)->sum('order_items.quantity');
         $productRows = (clone $productQuery)
-            ->select('products.name as name', DB::raw('SUM(order_items.total_price) as value'))
+            ->select(
+                'products.name as name',
+                DB::raw('SUM(order_items.total_price) as value'),
+                DB::raw('SUM(order_items.quantity) as count')
+            )
             ->groupBy('products.name')
             ->orderByDesc('value')
             ->limit(8)
@@ -292,6 +300,7 @@ class DashboardController extends Controller
             $products->push([
                 'name' => 'منتجات أخرى',
                 'value' => $productTotal - $shownProductTotal,
+                'count' => (int) max(0, $productTotalCount - (float) $productRows->sum('count')),
             ]);
         }
 
@@ -303,7 +312,11 @@ class DashboardController extends Controller
             ->where('orders.payment_status', 'paid')
             ->where('orders.status', '!=', 'cancelled')
             ->whereBetween('orders.created_at', [$from, $to])
-            ->select(DB::raw("COALESCE(categories.name, 'بدون صنف') as name"), DB::raw('SUM(order_items.total_price) as value'))
+            ->select(
+                DB::raw("COALESCE(categories.name, 'بدون صنف') as name"),
+                DB::raw('SUM(order_items.total_price) as value'),
+                DB::raw('SUM(order_items.quantity) as count')
+            )
             ->groupByRaw("COALESCE(categories.name, 'بدون صنف')")
             ->orderByDesc('value')
             ->get());
@@ -313,7 +326,7 @@ class DashboardController extends Controller
             ->where('orders.restaurant_id', $restaurantId)
             ->where('orders.payment_status', 'paid')
             ->whereBetween('orders.created_at', [$from, $to])
-            ->select('users.name as name', DB::raw('SUM(orders.total_amount) as value'))
+            ->select('users.name as name', DB::raw('SUM(orders.total_amount) as value'), DB::raw('COUNT(*) as count'))
             ->groupBy('users.name')
             ->orderByDesc('value')
             ->get());
@@ -322,7 +335,7 @@ class DashboardController extends Controller
             ->where('restaurant_id', $restaurantId)
             ->where('paymentable_type', Order::class)
             ->whereBetween('paid_at', [$from, $to])
-            ->select('method as name', DB::raw('SUM(amount) as value'))
+            ->select('method as name', DB::raw('SUM(amount) as value'), DB::raw('COUNT(*) as count'))
             ->groupBy('method')
             ->orderByDesc('value')
             ->get();
@@ -332,7 +345,7 @@ class DashboardController extends Controller
                 ->where('payment_status', 'paid')
                 ->whereBetween('created_at', [$from, $to])
                 ->whereNotNull('payment_method')
-                ->select('payment_method as name', DB::raw('SUM(total_amount) as value'))
+                ->select('payment_method as name', DB::raw('SUM(total_amount) as value'), DB::raw('COUNT(*) as count'))
                 ->groupBy('payment_method')
                 ->orderByDesc('value')
                 ->get();
