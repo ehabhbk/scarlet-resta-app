@@ -66,10 +66,24 @@ class CashierAccountService
     public function ensureRevenueAccountFor(User $user): Account
     {
         $restaurantId = $user->restaurant_id;
-        $parent = Account::firstOrCreate(
-            ['restaurant_id' => $restaurantId, 'code' => '4000'],
-            ['name' => 'إيرادات المبيعات', 'type' => 'revenue', 'opening_balance' => 0, 'is_active' => true]
-        );
+        $parent = Account::withTrashed()
+            ->where('restaurant_id', $restaurantId)
+            ->where('code', '4000')
+            ->first();
+        if (! $parent) {
+            $parent = Account::create([
+                'restaurant_id' => $restaurantId,
+                'code' => '4000',
+                'name' => 'إيرادات المبيعات',
+                'type' => 'revenue',
+                'opening_balance' => 0,
+                'is_active' => true,
+            ]);
+        } elseif ($parent->trashed()) {
+            $parent->restore();
+            $parent->is_active = true;
+            $parent->save();
+        }
 
         if ($parent->type !== 'revenue' || ! $parent->is_active) {
             throw ValidationException::withMessages([
