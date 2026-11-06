@@ -41,10 +41,11 @@ class ReportController extends Controller
         $restaurantId = $request->user()->restaurant_id;
         $from = $request->query('from', Carbon::now()->startOfMonth()->format('Y-m-d'));
         $to = $request->query('to', Carbon::now()->format('Y-m-d'));
+        $toEnd = Carbon::parse($to)->endOfDay()->format('Y-m-d H:i:s');
 
         $revenue = Order::where('restaurant_id', $restaurantId)
             ->where('payment_status', 'paid')
-            ->whereBetween('created_at', [$from, $to])
+            ->whereBetween('created_at', [$from, $toEnd])
             ->sum('total_amount');
 
         $expense = Expense::where('restaurant_id', $restaurantId)
@@ -159,8 +160,13 @@ class ReportController extends Controller
     public function paymentMethods(Request $request)
     {
         $restaurantId = $request->user()->restaurant_id;
+        $from = $request->query('from', Carbon::now()->startOfMonth()->format('Y-m-d'));
+        $to = $request->query('to', Carbon::now()->format('Y-m-d'));
+        $toEnd = Carbon::parse($to)->endOfDay()->format('Y-m-d H:i:s');
+
         $data = Order::where('restaurant_id', $restaurantId)
             ->where('payment_status', 'paid')
+            ->whereBetween('created_at', [$from, $toEnd])
             ->select('payment_method', DB::raw('SUM(total_amount) as total'), DB::raw('COUNT(*) as count'))
             ->groupBy('payment_method')
             ->get();
