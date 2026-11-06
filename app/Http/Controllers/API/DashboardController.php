@@ -210,21 +210,23 @@ class DashboardController extends Controller
     public function staffPerformance(Request $request)
     {
         $restaurantId = $request->user()->restaurant_id;
+        [$from, $to] = $this->resolveRange($request);
 
         $staff = User::where('restaurant_id', $restaurantId)
             ->where('is_active', true)
             ->with('roles')
             ->get()
-            ->map(function ($u) use ($restaurantId) {
+            ->map(function ($u) use ($restaurantId, $from, $to) {
                 $orders = Order::where('restaurant_id', $restaurantId)
                     ->where('cashier_id', $u->id)
-                    ->where('status', '!=', 'cancelled');
+                    ->where('status', '!=', 'cancelled')
+                    ->whereBetween('created_at', [$from, $to]);
                 return [
                     'id' => $u->id,
                     'name' => $u->name,
                     'username' => $u->username,
                     'role' => $u->getRoleNames()->first(),
-                    'orders_completed' => (int) $orders->count(),
+                    'orders_completed' => (int) (clone $orders)->count(),
                     'revenue' => (float) (clone $orders)->where('payment_status', 'paid')->sum('total_amount'),
                 ];
             })
