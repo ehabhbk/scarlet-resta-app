@@ -405,13 +405,10 @@ class ShiftWorkflowController extends Controller
             ->where('pay_auto', true)
             ->whereIn('pay_type', ['daily', 'percentage'])
             ->map(function (Employee $employee) use ($revenue, $workDate, $shift, $group): array {
+                \Log::info('employee pivot', ['id'=>$employee->id, 'paid_at'=>$employee->pivot->paid_at, 'payment_method'=>$employee->pivot->payment_method]);
                 $amount = $employee->pay_type === 'daily'
                     ? (float) $employee->pay_rate
                     : $revenue * ((float) $employee->pay_rate / 100);
-                $reference = $this->wageReference($employee, $workDate, $shift, $group);
-                $existingEntry = JournalEntry::where('restaurant_id', $shift->restaurant_id)
-                    ->where('reference', $reference)
-                    ->first();
 
                 return [
                     'id' => $employee->id,
@@ -420,8 +417,8 @@ class ShiftWorkflowController extends Controller
                     'pay_rate' => (float) $employee->pay_rate,
                     'amount' => round($amount, 2),
                     'payment_method' => $employee->pivot->payment_method,
-                    'paid_at' => $employee->pivot->paid_at ?: $existingEntry?->created_at,
-                    'journal_entry_id' => $employee->pivot->journal_entry_id ?: $existingEntry?->id,
+                    'paid_at' => $employee->pivot->paid_at,
+                    'journal_entry_id' => $employee->pivot->journal_entry_id,
                 ];
             })
             ->filter(fn (array $wage) => ! $wage['paid_at'] && $wage['amount'] > 0)
@@ -1041,6 +1038,7 @@ class ShiftWorkflowController extends Controller
             ->values();
 
         $expenses = \App\Models\Expense::where('restaurant_id', $restaurantId)
+            ->where('shift_id', $shift->id)
             ->whereIn(DB::raw('DATE(expense_date)'), $shiftDates->all())
             ->with('user')
             ->orderBy('expense_date')

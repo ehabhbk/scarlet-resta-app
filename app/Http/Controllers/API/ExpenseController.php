@@ -29,6 +29,13 @@ class ExpenseController extends Controller
         if ($request->has('to')) {
             $query->where('expense_date', '<=', $request->to);
         }
+        if ($request->filled('search')) {
+            $search = $request->search;
+            $query->where(function ($q) use ($search) {
+                $q->where('description', 'like', '%'.$search.'%')
+                    ->orWhere('category', 'like', '%'.$search.'%');
+            });
+        }
 
         return response()->json($query->orderByDesc('expense_date')->paginate(15));
     }
@@ -51,9 +58,20 @@ class ExpenseController extends Controller
             'receipt' => 'nullable|string',
             'payment_method' => 'required|string|max:50',
             'is_approved' => 'sometimes|boolean',
+            'shift_id' => 'nullable|integer',
         ]);
         $validated['restaurant_id'] = $request->user()->restaurant_id;
         $validated['user_id'] = $request->user()->id;
+        if (! empty($validated['shift_id'])) {
+            $shift = \App\Models\Shift::where('restaurant_id', $request->user()->restaurant_id)
+                ->where('id', $validated['shift_id'])
+                ->first();
+            if (! $shift) {
+                unset($validated['shift_id']);
+            }
+        } else {
+            unset($validated['shift_id']);
+        }
         $validated['amount'] = round((float) $validated['amount'], 2);
         if ($validated['amount'] <= 0) {
             throw ValidationException::withMessages([
